@@ -1269,6 +1269,15 @@ pub enum CapabilityOutcome {
         safe_summary: String,
     },
     SpawnedProcess(ProcessHandleSummary),
+    AwaitDependentRun {
+        gate_ref: LoopGateRef,
+        safe_summary: String,
+    },
+    SpawnedChildRun {
+        child_run_id: TurnRunId,
+        result_ref: LoopResultRef,
+        safe_summary: String,
+    },
     Denied(CapabilityDenied),
     Failed(CapabilityFailure),
 }
@@ -1280,6 +1289,7 @@ impl CapabilityOutcome {
             Self::ApprovalRequired { .. }
                 | Self::AuthRequired { .. }
                 | Self::ResourceBlocked { .. }
+                | Self::AwaitDependentRun { .. }
                 | Self::SpawnedProcess(_)
         )
     }
@@ -1743,12 +1753,14 @@ pub enum BatchPolicyKind {
     Parallel,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopGateKind {
     Approval,
     Auth,
     ResourceWait,
+    AwaitDependentRun,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

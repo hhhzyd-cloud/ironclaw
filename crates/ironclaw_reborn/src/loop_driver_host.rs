@@ -1922,6 +1922,10 @@ fn turn_error_to_host_error(error: TurnError) -> AgentLoopHostError {
             AgentLoopHostErrorKind::CheckpointRejected,
             "checkpoint state write conflicted with current turn state",
         ),
+        TurnError::CapacityExceeded { .. } => AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Unavailable,
+            "checkpoint state store capacity was exceeded",
+        ),
         TurnError::InvalidTransition { .. } => AgentLoopHostError::new(
             AgentLoopHostErrorKind::CheckpointRejected,
             "checkpoint state write was invalid for current turn state",
