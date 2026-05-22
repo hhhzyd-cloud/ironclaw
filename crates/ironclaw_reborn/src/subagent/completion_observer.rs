@@ -93,39 +93,48 @@ where
             .record_child_terminal(event.run_id, terminal_event_from_lifecycle(event))
             .map_err(map_host_error)?;
         self.recover_missing_gate_record(event).await?;
+        let mut claimed = Vec::new();
         while let Some(state) = self
             .gate_store
             .claim_next_terminal_state_for_child(event.run_id)
             .map_err(map_host_error)?
         {
-            if let Err(error) = self.handle_claimed_terminal_state(state).await {
-                let (gate_ref, error) = error;
+            claimed.push(state);
+        }
+        let claimed_gates = claimed
+            .iter()
+            .map(|state| state.record.gate_ref.clone())
+            .collect::<Vec<_>>();
+        if let Err(error) = self.handle_claimed_terminal_states(claimed).await {
+            for gate_ref in claimed_gates {
                 let _ = self.gate_store.release_terminal_claim(&gate_ref);
-                return Err(error);
             }
+            return Err(error);
         }
         Ok(())
     }
 
-    async fn handle_claimed_terminal_state(
+    async fn handle_claimed_terminal_states(
         &self,
-        state: crate::subagent::gate_resolution::AwaitedChildState,
-    ) -> Result<(), (GateRef, TurnError)> {
-        let terminal_event = state.terminal_event.ok_or_else(|| {
-            (
-                state.record.gate_ref.clone(),
-                TurnError::Unavailable {
-                    reason: "subagent gate replay selected state without terminal metadata"
-                        .to_string(),
-                },
-            )
-        })?;
-        let result = async {
+        states: Vec<crate::subagent::gate_resolution::AwaitedChildState>,
+    ) -> Result<(), TurnError> {
+        let mut delivered_gates = Vec::new();
+        let mut parent_resumes = Vec::new();
+        for state in states {
+            let terminal_event = state.terminal_event.ok_or_else(|| TurnError::Unavailable {
+                reason: "subagent gate replay selected state without terminal metadata".to_string(),
+            })?;
             match state.record.mode {
                 SpawnSubagentMode::Blocking => {
                     self.write_terminal_result(&state.record, &terminal_event)
                         .await?;
-                    self.resume_parent(&terminal_event, &state.record).await?;
+                    if !parent_resumes.iter().any(
+                        |(record, _): &(AwaitedChildSetRecord, AwaitedChildTerminalEvent)| {
+                            record.gate_ref == state.record.gate_ref
+                        },
+                    ) {
+                        parent_resumes.push((state.record.clone(), terminal_event.clone()));
+                    }
                 }
                 SpawnSubagentMode::Background => {
                     self.write_terminal_result(&state.record, &terminal_event)
@@ -137,17 +146,23 @@ where
                 .delete_goal(&state.record.child_scope, state.record.child_run_id)
                 .await
                 .map_err(map_host_error)?;
+            if !delivered_gates.contains(&state.record.gate_ref) {
+                delivered_gates.push(state.record.gate_ref.clone());
+            }
+        }
+        for (record, terminal_event) in parent_resumes {
+            self.resume_parent(&terminal_event, &record).await?;
+        }
+        for gate_ref in delivered_gates {
             self.gate_store
-                .mark_delivered(&state.record.gate_ref)
+                .mark_delivered(&gate_ref)
                 .map_err(map_host_error)?;
             self.gate_store
-                .delete_awaited_child(&state.record.gate_ref)
+                .delete_awaited_child(&gate_ref)
                 .await
                 .map_err(map_host_error)?;
-            Ok(())
         }
-        .await;
-        result.map_err(|error| (state.record.gate_ref, error))
+        Ok(())
     }
 
     async fn is_subagent_child(&self, event: &TurnLifecycleEvent) -> Result<bool, TurnError> {
@@ -582,8 +597,8 @@ fn awaited_child_record_from_persisted(
     metadata: SubagentThreadMetadata,
 ) -> Result<AwaitedChildSetRecord, TurnError> {
     let gate_ref = GateRef::new(match metadata.mode {
-        SpawnSubagentMode::Blocking => format!("gate:subagent:{}", child_record.run_id),
-        SpawnSubagentMode::Background => format!("gate:subagent-bg:{}", child_record.run_id),
+        SpawnSubagentMode::Blocking => format!("gate:subagent.{}", child_record.run_id),
+        SpawnSubagentMode::Background => format!("gate:subagent-bg.{}", child_record.run_id),
     })
     .map_err(|reason| TurnError::InvalidRequest { reason })?;
     let parent_run_context = LoopRunContext::new(

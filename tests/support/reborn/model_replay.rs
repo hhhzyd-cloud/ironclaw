@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -43,6 +44,11 @@ pub struct RebornTraceReplayModelGateway {
 pub enum RebornModelReplayStep {
     Response {
         response: HostManagedModelResponse,
+        expected_tool_results: Vec<ExpectedToolResult>,
+    },
+    DelayedResponse {
+        response: HostManagedModelResponse,
+        delay: Duration,
         expected_tool_results: Vec<ExpectedToolResult>,
     },
     ProviderToolCalls {
@@ -90,6 +96,10 @@ struct ReplayStep {
 #[derive(Debug, Clone)]
 enum ReplayOutput {
     Response(HostManagedModelResponse),
+    DelayedResponse {
+        response: HostManagedModelResponse,
+        delay: Duration,
+    },
     ProviderToolCalls(Vec<RebornScriptedProviderToolCall>),
 }
 
@@ -127,6 +137,14 @@ impl RebornTraceReplayModelGateway {
                         expected_tool_results,
                     } => ReplayStep {
                         output: ReplayOutput::Response(response),
+                        expected_tool_results,
+                    },
+                    RebornModelReplayStep::DelayedResponse {
+                        response,
+                        delay,
+                        expected_tool_results,
+                    } => ReplayStep {
+                        output: ReplayOutput::DelayedResponse { response, delay },
                         expected_tool_results,
                     },
                     RebornModelReplayStep::ProviderToolCalls {
@@ -180,6 +198,10 @@ impl HostManagedModelGateway for RebornTraceReplayModelGateway {
         let step = self.take_step(request)?;
         match step.output {
             ReplayOutput::Response(response) => Ok(response),
+            ReplayOutput::DelayedResponse { response, delay } => {
+                tokio::time::sleep(delay).await;
+                Ok(response)
+            }
             ReplayOutput::ProviderToolCalls(_) => Err(HostManagedModelError::safe(
                 HostManagedModelErrorKind::InvalidRequest,
                 "trace replay provider tool calls require capability-aware model streaming",
@@ -195,6 +217,10 @@ impl HostManagedModelGateway for RebornTraceReplayModelGateway {
         let step = self.take_step(request.clone())?;
         match step.output {
             ReplayOutput::Response(response) => Ok(response),
+            ReplayOutput::DelayedResponse { response, delay } => {
+                tokio::time::sleep(delay).await;
+                Ok(response)
+            }
             ReplayOutput::ProviderToolCalls(calls) => {
                 provider_tool_calls_response(&request, capabilities, calls).await
             }

@@ -44,9 +44,9 @@ use ironclaw_host_runtime::{
 };
 use ironclaw_loop_support::{
     CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
-    HostIdentityContextBuildError, HostIdentityContextCandidate, HostIdentityContextSource,
-    HostManagedModelRequest, HostRuntimeLoopCapabilityPortFactory, JsonSpawnSubagentInputCodec,
-    LoopCapabilityResultWriter,
+    DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID, HostIdentityContextBuildError,
+    HostIdentityContextCandidate, HostIdentityContextSource, HostManagedModelRequest,
+    HostRuntimeLoopCapabilityPortFactory, JsonSpawnSubagentInputCodec, LoopCapabilityResultWriter,
 };
 use ironclaw_product_adapters::{
     ProductInboundAck, ProductInboundEnvelope, ProductInboundPayload, ProductTriggerReason,
@@ -89,7 +89,7 @@ use ironclaw_turns::{
     GetRunStateRequest, IdempotencyKey, InMemoryCheckpointStateStore, LoopBlockedKind,
     LoopCheckpointKind, LoopCheckpointStore, LoopGateRef, LoopResultRef, ReplyTargetBindingRef,
     ResumeTurnRequest, SanitizedCancelReason, SourceBindingRef, TurnActor, TurnCoordinator,
-    TurnError, TurnRunId, TurnRunState, TurnScope, TurnStateStore, TurnStatus,
+    TurnError, TurnRunId, TurnRunRecord, TurnRunState, TurnScope, TurnStateStore, TurnStatus,
     run_profile::{
         AgentLoopHostError, AgentLoopHostErrorKind, CapabilityBatchInvocation,
         CapabilityBatchOutcome, CapabilityCallCandidate, CapabilityDescriptorView,
@@ -117,6 +117,7 @@ pub type HarnessWaitConfig = WaitConfig;
 
 const TEST_CAPABILITY_ID: &str = "test.echo";
 const TEST_CAPABILITY_SURFACE_VERSION: &str = "trace_replay_v1";
+const SPAWN_SUBAGENT_TOOL_NAME: &str = "spawn_subagent";
 
 type HarnessResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type HarnessCapabilityParts = (
@@ -135,7 +136,7 @@ pub struct RebornBinaryE2EHarness {
     thread_scope: ThreadScope,
     turn_scope: TurnScope,
     turn_store: Arc<FilesystemTurnStateStore<LocalFilesystem>>,
-    coordinator: Arc<dyn ironclaw_turns::TurnCoordinator>,
+    coordinator: Arc<dyn TurnCoordinator>,
     _product_harness: RebornProductWorkflowHarness,
     thread_harness: RebornThreadHarness,
     model_gateway: RebornTraceReplayModelGateway,
@@ -257,6 +258,21 @@ impl RebornBinaryE2EHarness {
             model_gateway,
             capability_port,
             false,
+            false,
+        )
+        .await
+    }
+
+    pub async fn with_harness_blocked_evidence_unscoped_worker(
+        conversation_id: &str,
+        model_gateway: RebornTraceReplayModelGateway,
+        capability_port: RecordingTestCapabilityPort,
+    ) -> HarnessResult<Self> {
+        Self::with_model_gateway_options_and_worker_scope(
+            conversation_id,
+            model_gateway,
+            capability_port,
+            true,
             false,
         )
         .await
@@ -1116,6 +1132,14 @@ impl RebornBinaryE2EHarness {
             .messages)
     }
 
+    pub async fn children_of(
+        &self,
+        scope: &TurnScope,
+        run_id: TurnRunId,
+    ) -> HarnessResult<Vec<TurnRunRecord>> {
+        Ok(self.turn_store.children_of(scope, run_id).await?)
+    }
+
     pub fn model_requests(&self) -> Vec<HostManagedModelRequest> {
         self.model_gateway.requests()
     }
@@ -1185,8 +1209,10 @@ impl LoopExitEvidencePort for HarnessLoopExitEvidencePort {
         if !self.accept_harness_blocked_evidence {
             return Ok(false);
         }
-        if request.blocked.kind != LoopBlockedKind::Approval
-            || GateRef::new(request.blocked.gate_ref.as_str()).is_err()
+        if !matches!(
+            request.blocked.kind,
+            LoopBlockedKind::Approval | LoopBlockedKind::AwaitDependentRun
+        ) || GateRef::new(request.blocked.gate_ref.as_str()).is_err()
         {
             return Ok(false);
         }
@@ -1251,9 +1277,7 @@ impl HarnessCapabilityMode {
                         port: Arc::clone(&port),
                     }),
                     Arc::new(StaticCapabilitySurfaceProfileResolver {
-                        allow_set: CapabilityAllowSet::allowlist([CapabilityId::new(
-                            TEST_CAPABILITY_ID,
-                        )?]),
+                        allow_set: CapabilityAllowSet::allowlist(port.capability_allowlist()),
                     }),
                     capability_io.clone(),
                     capability_io,
@@ -1712,6 +1736,7 @@ fn host_runtime_harness_error(error: impl std::fmt::Display) -> AgentLoopHostErr
 #[derive(Clone)]
 pub struct RecordingTestCapabilityPort {
     mode: CapabilityMode,
+    expose_spawn_subagent: bool,
     invocations: Arc<Mutex<Vec<CapabilityInvocation>>>,
     next_result: Arc<AtomicUsize>,
     approval_calls: Arc<AtomicUsize>,
@@ -1725,16 +1750,21 @@ enum CapabilityMode {
 
 impl RecordingTestCapabilityPort {
     pub fn echo() -> Self {
-        Self::new(CapabilityMode::Echo)
+        Self::new(CapabilityMode::Echo, false)
+    }
+
+    pub fn echo_with_spawn_subagent() -> Self {
+        Self::new(CapabilityMode::Echo, true)
     }
 
     pub fn approval_then_echo() -> Self {
-        Self::new(CapabilityMode::ApprovalThenEcho)
+        Self::new(CapabilityMode::ApprovalThenEcho, false)
     }
 
-    fn new(mode: CapabilityMode) -> Self {
+    fn new(mode: CapabilityMode, expose_spawn_subagent: bool) -> Self {
         Self {
             mode,
+            expose_spawn_subagent,
             invocations: Arc::new(Mutex::new(Vec::new())),
             next_result: Arc::new(AtomicUsize::new(1)),
             approval_calls: Arc::new(AtomicUsize::new(0)),
@@ -1747,6 +1777,18 @@ impl RecordingTestCapabilityPort {
 
     pub fn invocation_count(&self) -> usize {
         self.invocations.lock().unwrap().len()
+    }
+
+    fn capability_allowlist(&self) -> Vec<CapabilityId> {
+        let mut allowlist =
+            vec![CapabilityId::new(TEST_CAPABILITY_ID).expect("valid capability id")];
+        if self.expose_spawn_subagent {
+            allowlist.push(
+                CapabilityId::new(DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID)
+                    .expect("valid capability id"),
+            );
+        }
+        allowlist
     }
 
     fn completed_result(&self) -> CapabilityOutcome {
@@ -1763,7 +1805,7 @@ impl RecordingTestCapabilityPort {
 #[async_trait]
 impl LoopCapabilityPort for RecordingTestCapabilityPort {
     fn tool_definitions(&self) -> Result<Vec<ProviderToolDefinition>, AgentLoopHostError> {
-        Ok(vec![ProviderToolDefinition {
+        let mut definitions = vec![ProviderToolDefinition {
             capability_id: CapabilityId::new(TEST_CAPABILITY_ID).expect("valid capability id"),
             name: "test_echo".to_string(),
             description: "Echo a test payload".to_string(),
@@ -1773,17 +1815,42 @@ impl LoopCapabilityPort for RecordingTestCapabilityPort {
                     "message": {"type": "string"}
                 }
             }),
-        }])
+        }];
+        if self.expose_spawn_subagent {
+            definitions.push(ProviderToolDefinition {
+                capability_id: CapabilityId::new(DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID)
+                    .expect("valid capability id"),
+                name: SPAWN_SUBAGENT_TOOL_NAME.to_string(),
+                description: "Spawn a subagent child run".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "flavor_id": {"type": "string"},
+                        "task": {"type": "string"},
+                        "handoff": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["blocking", "background"]},
+                        "run_in_background": {"type": "boolean"}
+                    },
+                    "required": ["flavor_id", "task"]
+                }),
+            });
+        }
+        Ok(definitions)
     }
 
     async fn register_provider_tool_call(
         &self,
         call: ProviderToolCall,
     ) -> Result<CapabilityCallCandidate, AgentLoopHostError> {
+        let capability_id = if self.expose_spawn_subagent && call.name == SPAWN_SUBAGENT_TOOL_NAME {
+            CapabilityId::new(DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID).expect("valid capability id")
+        } else {
+            CapabilityId::new(TEST_CAPABILITY_ID).expect("valid capability id")
+        };
         Ok(CapabilityCallCandidate {
             surface_version: CapabilitySurfaceVersion::new(TEST_CAPABILITY_SURFACE_VERSION)
                 .expect("valid surface version"),
-            capability_id: CapabilityId::new(TEST_CAPABILITY_ID).expect("valid capability id"),
+            capability_id,
             input_ref: CapabilityInputRef::new(format!("input:{}", call.id))
                 .expect("valid input ref"),
             provider_replay: Some(ProviderToolCallReplay {
@@ -1804,18 +1871,31 @@ impl LoopCapabilityPort for RecordingTestCapabilityPort {
         &self,
         _request: VisibleCapabilityRequest,
     ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
+        let mut descriptors = vec![CapabilityDescriptorView {
+            capability_id: CapabilityId::new(TEST_CAPABILITY_ID).expect("valid capability id"),
+            provider: Some(ExtensionId::new("test").expect("valid provider")),
+            runtime: RuntimeKind::FirstParty,
+            safe_name: "test_echo".to_string(),
+            safe_description: "Echo a test payload".to_string(),
+            concurrency_hint: ConcurrencyHint::SafeForParallel,
+            parameters_schema: json!({"type": "object"}),
+        }];
+        if self.expose_spawn_subagent {
+            descriptors.push(CapabilityDescriptorView {
+                capability_id: CapabilityId::new(DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID)
+                    .expect("valid capability id"),
+                provider: Some(ExtensionId::new("test").expect("valid provider")),
+                runtime: RuntimeKind::FirstParty,
+                safe_name: SPAWN_SUBAGENT_TOOL_NAME.to_string(),
+                safe_description: "Spawn a subagent child run".to_string(),
+                concurrency_hint: ConcurrencyHint::Exclusive,
+                parameters_schema: json!({"type": "object"}),
+            });
+        }
         Ok(VisibleCapabilitySurface {
             version: CapabilitySurfaceVersion::new(TEST_CAPABILITY_SURFACE_VERSION)
                 .expect("valid surface version"),
-            descriptors: vec![CapabilityDescriptorView {
-                capability_id: CapabilityId::new(TEST_CAPABILITY_ID).expect("valid capability id"),
-                provider: Some(ExtensionId::new("test").expect("valid provider")),
-                runtime: RuntimeKind::FirstParty,
-                safe_name: "test_echo".to_string(),
-                safe_description: "Echo a test payload".to_string(),
-                concurrency_hint: ConcurrencyHint::SafeForParallel,
-                parameters_schema: json!({"type": "object"}),
-            }],
+            descriptors,
         })
     }
 

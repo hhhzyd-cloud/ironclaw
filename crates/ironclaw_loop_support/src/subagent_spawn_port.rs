@@ -270,8 +270,15 @@ impl SubagentSpawnCapabilityPort {
 
     async fn handle_spawn(
         &self,
-        _invocation: &CapabilityInvocation,
         args: SpawnSubagentArgs,
+    ) -> Result<CapabilityOutcome, AgentLoopHostError> {
+        self.handle_spawn_with_gate(args, None).await
+    }
+
+    async fn handle_spawn_with_gate(
+        &self,
+        args: SpawnSubagentArgs,
+        gate_override: Option<GateRef>,
     ) -> Result<CapabilityOutcome, AgentLoopHostError> {
         if !self.try_reserve_spawn_slot() {
             return Ok(spawn_rejected("fanout_cap_exceeded"));
@@ -395,6 +402,7 @@ impl SubagentSpawnCapabilityPort {
                 tree_root,
                 child_depth,
                 actor,
+                gate_override,
                 &mut goal_written,
                 &mut gate_written,
                 &mut result_written,
@@ -497,6 +505,7 @@ impl SubagentSpawnCapabilityPort {
         tree_root: TurnRunId,
         child_depth: u32,
         actor: TurnActor,
+        gate_override: Option<GateRef>,
         goal_written: &mut bool,
         gate_written: &mut Option<GateRef>,
         result_written: &mut Option<LoopResultRef>,
@@ -505,11 +514,14 @@ impl SubagentSpawnCapabilityPort {
             ThreadId::new(format!("subagent-{}", child_run_id.as_uuid().simple()))
                 .map_err(invalid_static_ref)?;
         let mode = args.spawn_mode();
-        let gate_ref = GateRef::new(match mode {
-            SpawnSubagentMode::Blocking => format!("gate:subagent:{child_run_id}"),
-            SpawnSubagentMode::Background => format!("gate:subagent-bg:{child_run_id}"),
-        })
-        .map_err(invalid_static_ref)?;
+        let gate_ref = match gate_override {
+            Some(gate_ref) => gate_ref,
+            None => GateRef::new(match mode {
+                SpawnSubagentMode::Blocking => format!("gate:subagent.{child_run_id}"),
+                SpawnSubagentMode::Background => format!("gate:subagent-bg.{child_run_id}"),
+            })
+            .map_err(invalid_static_ref)?,
+        };
         let payload = spawn_result_payload(
             child_run_id,
             &child_thread_id,
@@ -756,7 +768,7 @@ impl LoopCapabilityPort for SubagentSpawnCapabilityPort {
                 .spawn_input_codec
                 .decode(&self.run_context, &request.input_ref)
                 .await?;
-            return self.handle_spawn(&request, args).await;
+            return self.handle_spawn(args).await;
         }
         self.inner.invoke_capability(request).await
     }
@@ -766,6 +778,19 @@ impl LoopCapabilityPort for SubagentSpawnCapabilityPort {
         request: CapabilityBatchInvocation,
     ) -> Result<CapabilityBatchOutcome, AgentLoopHostError> {
         let mut outcomes = Vec::with_capacity(request.invocations.len());
+        let spawn_count = request
+            .invocations
+            .iter()
+            .filter(|invocation| self.is_spawn(&invocation.capability_id))
+            .count();
+        let batch_blocking_gate = if spawn_count > 1 {
+            Some(
+                GateRef::new(format!("gate:subagent-batch.{}", TurnRunId::new()))
+                    .map_err(invalid_static_ref)?,
+            )
+        } else {
+            None
+        };
         let mut index = 0_usize;
         while index < request.invocations.len() {
             let invocation = &request.invocations[index];
@@ -778,11 +803,14 @@ impl LoopCapabilityPort for SubagentSpawnCapabilityPort {
                         .spawn_input_codec
                         .decode(&self.run_context, &invocation.input_ref)
                         .await?;
-                    self.handle_spawn(invocation, args).await?
+                    let gate_override = (args.spawn_mode() == SpawnSubagentMode::Blocking)
+                        .then(|| batch_blocking_gate.clone())
+                        .flatten();
+                    self.handle_spawn_with_gate(args, gate_override).await?
                 };
                 let suspended = outcome.is_suspension();
                 outcomes.push(outcome);
-                if suspended && request.stop_on_first_suspension {
+                if suspended && request.stop_on_first_suspension && batch_blocking_gate.is_none() {
                     return Ok(CapabilityBatchOutcome {
                         outcomes,
                         stopped_on_suspension: true,
