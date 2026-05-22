@@ -15,8 +15,8 @@ use ironclaw_loop_support::{
 use ironclaw_threads::{SessionThreadService, ThreadScope};
 use ironclaw_turns::{
     AgentLoopDriverError, CheckpointStateStore, DefaultTurnCoordinator, LoopCheckpointStore,
-    RunProfileResolver, TurnCommittedEventObserver, TurnEventProjectionSource, TurnEventSink,
-    TurnRunWakeNotifier, TurnStateStore,
+    RunProfileResolver, TurnCommittedEventObserver, TurnEventSink, TurnRunWakeNotifier,
+    TurnStateStore,
     loop_exit::LoopExitEvidencePort,
     run_profile::{
         AgentLoopHostError, InstructionSafetyContext, LoopCapabilityPort, LoopHostMilestoneSink,
@@ -58,7 +58,7 @@ pub struct DefaultPlannedRuntimeConfig {
 
 pub struct DefaultPlannedRuntimeParts<T, S, G>
 where
-    T: TurnStateStore + TurnEventProjectionSource + TurnRunTransitionPort + Send + Sync + 'static,
+    T: TurnStateStore + TurnRunTransitionPort + Send + Sync + 'static,
     S: SessionThreadService + Send + Sync + 'static,
     G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
 {
@@ -109,7 +109,7 @@ impl<T> RuntimeSubagentGoalStore for T where
 
 pub struct RebornRuntimeLoopComposition<T, S, G>
 where
-    T: TurnStateStore + TurnEventProjectionSource + TurnRunTransitionPort + Send + Sync + 'static,
+    T: TurnStateStore + TurnRunTransitionPort + Send + Sync + 'static,
     S: SessionThreadService + Send + Sync + 'static,
     G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
 {
@@ -237,7 +237,7 @@ pub fn build_product_live_planned_runtime<T, S, G>(
     mut parts: DefaultPlannedRuntimeParts<T, S, G>,
 ) -> Result<RebornRuntimeLoopComposition<T, S, G>, ProductLiveRuntimeBuildError>
 where
-    T: TurnStateStore + TurnEventProjectionSource + TurnRunTransitionPort + Send + Sync + 'static,
+    T: TurnStateStore + TurnRunTransitionPort + Send + Sync + 'static,
     S: SessionThreadService + Send + Sync + 'static,
     G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
 {
@@ -300,7 +300,7 @@ pub fn build_default_planned_runtime<T, S, G>(
     parts: DefaultPlannedRuntimeParts<T, S, G>,
 ) -> Result<RebornRuntimeLoopComposition<T, S, G>, DefaultPlannedRuntimeBuildError>
 where
-    T: TurnStateStore + TurnEventProjectionSource + TurnRunTransitionPort + Send + Sync + 'static,
+    T: TurnStateStore + TurnRunTransitionPort + Send + Sync + 'static,
     S: SessionThreadService + Send + Sync + 'static,
     G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
 {
