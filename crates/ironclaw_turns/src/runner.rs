@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BlockedReason, LoopExitMapping, ResolvedRunProfile, SanitizedFailure, TurnCheckpointId,
-    TurnError, TurnEventKind, TurnEventSink, TurnLeaseToken, TurnLifecycleEvent, TurnRunId,
-    TurnRunState, TurnRunnerId, TurnScope, TurnStatus, TurnTimestamp,
+    TurnCommittedEventObserver, TurnError, TurnEventKind, TurnEventSink, TurnLeaseToken,
+    TurnLifecycleEvent, TurnRunId, TurnRunState, TurnRunnerId, TurnScope, TurnStatus,
+    TurnTimestamp,
     events::EventCursor,
     run_profile::{LoopCheckpointStateRef, LoopModelRouteSnapshot},
 };
@@ -158,20 +159,41 @@ pub trait TurnRunTransitionPort: Send + Sync {
 
 pub struct EventPublishingTurnRunTransitionPort {
     inner: Arc<dyn TurnRunTransitionPort>,
-    sink: Arc<dyn TurnEventSink>,
+    sink: Option<Arc<dyn TurnEventSink>>,
+    required_observer: Option<Arc<dyn TurnCommittedEventObserver>>,
 }
 
 impl EventPublishingTurnRunTransitionPort {
     pub fn new(inner: Arc<dyn TurnRunTransitionPort>, sink: Arc<dyn TurnEventSink>) -> Self {
-        Self { inner, sink }
+        Self {
+            inner,
+            sink: Some(sink),
+            required_observer: None,
+        }
     }
 
-    async fn publish_state_event_best_effort(
+    pub fn new_optional_sink(
+        inner: Arc<dyn TurnRunTransitionPort>,
+        sink: Option<Arc<dyn TurnEventSink>>,
+    ) -> Self {
+        Self {
+            inner,
+            sink,
+            required_observer: None,
+        }
+    }
+
+    pub fn with_required_observer(mut self, observer: Arc<dyn TurnCommittedEventObserver>) -> Self {
+        self.required_observer = Some(observer);
+        self
+    }
+
+    async fn publish_state_event(
         &self,
         state: &TurnRunState,
         kind: TurnEventKind,
         sanitized_reason: Option<String>,
-    ) {
+    ) -> Result<(), TurnError> {
         let blocked_gate = if kind == TurnEventKind::Blocked {
             state.gate_ref.clone().and_then(|gate_ref| {
                 crate::events::TurnBlockedGateKind::from_status(state.status).map(|gate_kind| {
@@ -195,9 +217,19 @@ impl EventPublishingTurnRunTransitionPort {
             blocked_gate,
             sanitized_reason,
         };
-        if let Err(error) = self.sink.publish(event).await {
+        let required_observer = self
+            .required_observer
+            .as_ref()
+            .filter(|observer| observer.observes_event(&event));
+        if let Some(observer) = required_observer {
+            observer.observe_committed_event(event.clone()).await?;
+        }
+        if let Some(sink) = self.sink.as_ref()
+            && let Err(error) = sink.publish(event).await
+        {
             tracing::debug!(error = %error, "turn transition event sink publish failed");
         }
+        Ok(())
     }
 
     fn event_kind_for_state(state: &TurnRunState) -> TurnEventKind {
@@ -234,12 +266,8 @@ impl TurnRunTransitionPort for EventPublishingTurnRunTransitionPort {
     ) -> Result<Option<ClaimedTurnRun>, TurnError> {
         let claimed = self.inner.claim_next_run(request).await?;
         if let Some(claimed) = &claimed {
-            self.publish_state_event_best_effort(
-                &claimed.state,
-                TurnEventKind::RunnerClaimed,
-                None,
-            )
-            .await;
+            self.publish_state_event(&claimed.state, TurnEventKind::RunnerClaimed, None)
+                .await?;
         }
         Ok(claimed)
     }
@@ -254,12 +282,12 @@ impl TurnRunTransitionPort for EventPublishingTurnRunTransitionPort {
     ) -> Result<RecoverExpiredLeasesResponse, TurnError> {
         let response = self.inner.recover_expired_leases(request).await?;
         for state in &response.recovered {
-            self.publish_state_event_best_effort(
+            self.publish_state_event(
                 state,
                 TurnEventKind::RecoveryRequired,
                 Some("lease_expired".to_string()),
             )
-            .await;
+            .await?;
         }
         Ok(response)
     }
@@ -273,15 +301,15 @@ impl TurnRunTransitionPort for EventPublishingTurnRunTransitionPort {
 
     async fn block_run(&self, request: BlockRunRequest) -> Result<TurnRunState, TurnError> {
         let state = self.inner.block_run(request).await?;
-        self.publish_state_event_best_effort(&state, TurnEventKind::Blocked, None)
-            .await;
+        self.publish_state_event(&state, TurnEventKind::Blocked, None)
+            .await?;
         Ok(state)
     }
 
     async fn complete_run(&self, request: CompleteRunRequest) -> Result<TurnRunState, TurnError> {
         let state = self.inner.complete_run(request).await?;
-        self.publish_state_event_best_effort(&state, TurnEventKind::Completed, None)
-            .await;
+        self.publish_state_event(&state, TurnEventKind::Completed, None)
+            .await?;
         Ok(state)
     }
 
@@ -290,19 +318,19 @@ impl TurnRunTransitionPort for EventPublishingTurnRunTransitionPort {
         request: CancelRunCompletionRequest,
     ) -> Result<TurnRunState, TurnError> {
         let state = self.inner.cancel_run(request).await?;
-        self.publish_state_event_best_effort(&state, TurnEventKind::Cancelled, None)
-            .await;
+        self.publish_state_event(&state, TurnEventKind::Cancelled, None)
+            .await?;
         Ok(state)
     }
 
     async fn fail_run(&self, request: FailRunRequest) -> Result<TurnRunState, TurnError> {
         let state = self.inner.fail_run(request).await?;
-        self.publish_state_event_best_effort(
+        self.publish_state_event(
             &state,
             TurnEventKind::Failed,
             Self::sanitized_reason_for_state(&state),
         )
-        .await;
+        .await?;
         Ok(state)
     }
 
@@ -311,12 +339,12 @@ impl TurnRunTransitionPort for EventPublishingTurnRunTransitionPort {
         request: RecordRecoveryRequiredRequest,
     ) -> Result<TurnRunState, TurnError> {
         let state = self.inner.record_recovery_required(request).await?;
-        self.publish_state_event_best_effort(
+        self.publish_state_event(
             &state,
             TurnEventKind::RecoveryRequired,
             Self::sanitized_reason_for_state(&state),
         )
-        .await;
+        .await?;
         Ok(state)
     }
 
@@ -325,12 +353,12 @@ impl TurnRunTransitionPort for EventPublishingTurnRunTransitionPort {
         request: ApplyValidatedLoopExitRequest,
     ) -> Result<TurnRunState, TurnError> {
         let state = self.inner.apply_validated_loop_exit(request).await?;
-        self.publish_state_event_best_effort(
+        self.publish_state_event(
             &state,
             Self::event_kind_for_state(&state),
             Self::sanitized_reason_for_state(&state),
         )
-        .await;
+        .await?;
         Ok(state)
     }
 }

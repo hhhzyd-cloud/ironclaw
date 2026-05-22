@@ -15,13 +15,14 @@ use ironclaw_loop_support::{
 use ironclaw_threads::{SessionThreadService, ThreadScope};
 use ironclaw_turns::{
     AgentLoopDriverError, CheckpointStateStore, DefaultTurnCoordinator, LoopCheckpointStore,
-    RunProfileResolver, TurnRunWakeNotifier, TurnStateStore,
+    RunProfileResolver, TurnCommittedEventObserver, TurnEventProjectionSource, TurnEventSink,
+    TurnRunWakeNotifier, TurnStateStore,
     loop_exit::LoopExitEvidencePort,
     run_profile::{
         AgentLoopHostError, InstructionSafetyContext, LoopCapabilityPort, LoopHostMilestoneSink,
         LoopModelBudgetAccountant, LoopModelPolicyGuard, LoopRunContext,
     },
-    runner::TurnRunTransitionPort,
+    runner::{EventPublishingTurnRunTransitionPort, TurnRunTransitionPort},
 };
 
 use crate::{
@@ -38,12 +39,8 @@ use crate::{
         register_default_text_only_driver, register_subagent_planned_driver,
     },
     subagent::{
-        completion_observer::{
-            SubagentCompletionCoordinator, SubagentCompletionObserver,
-            SubagentCompletionTransitionPort,
-        },
-        gate_resolution::BoundedSubagentGateResolutionStore,
-        goal_store::SubagentGoalStore,
+        completion_observer::SubagentCompletionObserver,
+        gate_resolution::BoundedSubagentGateResolutionStore, goal_store::SubagentGoalStore,
         prompt_material::GateBackedSubagentPromptMaterialSource,
     },
     text_loop_driver::TextOnlyModelReplyDriverConfig,
@@ -61,7 +58,7 @@ pub struct DefaultPlannedRuntimeConfig {
 
 pub struct DefaultPlannedRuntimeParts<T, S, G>
 where
-    T: TurnStateStore + TurnRunTransitionPort + Send + Sync + 'static,
+    T: TurnStateStore + TurnEventProjectionSource + TurnRunTransitionPort + Send + Sync + 'static,
     S: SessionThreadService + Send + Sync + 'static,
     G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
 {
@@ -79,6 +76,7 @@ where
     pub subagent_gate_store: Arc<BoundedSubagentGateResolutionStore>,
     pub subagent_flavor_resolver: Arc<dyn SubagentFlavorPolicyResolver>,
     pub subagent_spawn_input_codec: Arc<dyn SpawnSubagentInputCodec>,
+    pub subagent_spawn_limits: SubagentSpawnLimits,
     pub loop_exit_evidence: Arc<dyn LoopExitEvidencePort>,
     pub config: DefaultPlannedRuntimeConfig,
     pub model_route_resolver: Option<Arc<dyn ModelRouteResolver>>,
@@ -96,6 +94,7 @@ where
     pub model_policy_guard: Option<Arc<dyn LoopModelPolicyGuard>>,
     pub model_budget_accountant: Option<Arc<dyn LoopModelBudgetAccountant>>,
     pub safety_context: Option<InstructionSafetyContext>,
+    pub turn_event_sink: Option<Arc<dyn TurnEventSink>>,
 }
 
 pub trait RuntimeSubagentGoalStore:
@@ -110,7 +109,7 @@ impl<T> RuntimeSubagentGoalStore for T where
 
 pub struct RebornRuntimeLoopComposition<T, S, G>
 where
-    T: TurnStateStore + TurnRunTransitionPort + Send + Sync + 'static,
+    T: TurnStateStore + TurnEventProjectionSource + TurnRunTransitionPort + Send + Sync + 'static,
     S: SessionThreadService + Send + Sync + 'static,
     G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
 {
@@ -128,6 +127,7 @@ pub enum DefaultPlannedRuntimeBuildError {
     DriverRegistry(DriverRegistryError),
     PlannedDriver(DefaultPlannedDriverRegistrationError),
     RunProfile(String),
+    SubagentCompletion(String),
 }
 
 impl fmt::Display for DefaultPlannedRuntimeBuildError {
@@ -136,6 +136,9 @@ impl fmt::Display for DefaultPlannedRuntimeBuildError {
             Self::DriverRegistry(error) => write!(formatter, "driver registry failed: {error}"),
             Self::PlannedDriver(error) => write!(formatter, "planned driver failed: {error}"),
             Self::RunProfile(error) => write!(formatter, "run profile resolver failed: {error}"),
+            Self::SubagentCompletion(error) => {
+                write!(formatter, "subagent completion wiring failed: {error}")
+            }
         }
     }
 }
@@ -234,7 +237,7 @@ pub fn build_product_live_planned_runtime<T, S, G>(
     mut parts: DefaultPlannedRuntimeParts<T, S, G>,
 ) -> Result<RebornRuntimeLoopComposition<T, S, G>, ProductLiveRuntimeBuildError>
 where
-    T: TurnStateStore + TurnRunTransitionPort + Send + Sync + 'static,
+    T: TurnStateStore + TurnEventProjectionSource + TurnRunTransitionPort + Send + Sync + 'static,
     S: SessionThreadService + Send + Sync + 'static,
     G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
 {
@@ -297,7 +300,7 @@ pub fn build_default_planned_runtime<T, S, G>(
     parts: DefaultPlannedRuntimeParts<T, S, G>,
 ) -> Result<RebornRuntimeLoopComposition<T, S, G>, DefaultPlannedRuntimeBuildError>
 where
-    T: TurnStateStore + TurnRunTransitionPort + Send + Sync + 'static,
+    T: TurnStateStore + TurnEventProjectionSource + TurnRunTransitionPort + Send + Sync + 'static,
     S: SessionThreadService + Send + Sync + 'static,
     G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
 {
@@ -336,23 +339,27 @@ where
         )),
         None => worker_wake_notifier,
     };
-    let base_coordinator: Arc<dyn ironclaw_turns::TurnCoordinator> = Arc::new(
-        DefaultTurnCoordinator::new(Arc::clone(&parts.turn_state))
-            .with_run_profile_resolver(Arc::clone(&run_profile_resolver))
-            .with_wake_notifier(Arc::clone(&wake_notifier)),
-    );
     let turn_state_for_observer: Arc<dyn TurnStateStore> = parts.turn_state.clone();
-    let completion_observer = Arc::new(SubagentCompletionObserver::new(
+    let completion_observer = Arc::new(SubagentCompletionObserver::new_unbound(
         Arc::clone(&parts.subagent_gate_store),
         Arc::clone(&parts.subagent_goal_store) as Arc<dyn SubagentSpawnGoalStore>,
         turn_state_for_observer,
         Arc::clone(&parts.capability_result_writer),
-        Arc::clone(&base_coordinator),
         Arc::clone(&parts.thread_service),
     ));
-    let coordinator: Arc<dyn ironclaw_turns::TurnCoordinator> = Arc::new(
-        SubagentCompletionCoordinator::new(base_coordinator, completion_observer.clone()),
-    );
+    let subagent_completion_observer: Arc<dyn TurnCommittedEventObserver> =
+        completion_observer.clone();
+    let mut base_coordinator = DefaultTurnCoordinator::new(Arc::clone(&parts.turn_state))
+        .with_run_profile_resolver(Arc::clone(&run_profile_resolver))
+        .with_wake_notifier(Arc::clone(&wake_notifier))
+        .with_required_event_observer(Arc::clone(&subagent_completion_observer));
+    if let Some(turn_event_sink) = parts.turn_event_sink.clone() {
+        base_coordinator = base_coordinator.with_event_sink(turn_event_sink);
+    }
+    let coordinator: Arc<dyn ironclaw_turns::TurnCoordinator> = Arc::new(base_coordinator);
+    completion_observer
+        .bind_coordinator(Arc::clone(&coordinator))
+        .map_err(|error| DefaultPlannedRuntimeBuildError::SubagentCompletion(error.to_string()))?;
 
     let turn_state_store: Arc<dyn TurnStateStore> = parts.turn_state.clone();
     let subagent_prompt_source = Arc::new(GateBackedSubagentPromptMaterialSource::new(
@@ -376,6 +383,7 @@ where
                 spawn_input_codec: Arc::clone(&parts.subagent_spawn_input_codec),
                 result_writer: Arc::clone(&parts.capability_result_writer),
             },
+            parts.subagent_spawn_limits,
             subagent_prompt_composer.clone(),
         )?);
     let mut host_factory = RebornLoopDriverHostFactory::new(
@@ -417,7 +425,11 @@ where
 
     let transition_port_inner: Arc<dyn TurnRunTransitionPort> = parts.turn_state;
     let transition_port: Arc<dyn TurnRunTransitionPort> = Arc::new(
-        SubagentCompletionTransitionPort::new(transition_port_inner, completion_observer),
+        EventPublishingTurnRunTransitionPort::new_optional_sink(
+            transition_port_inner,
+            parts.turn_event_sink,
+        )
+        .with_required_observer(subagent_completion_observer),
     );
     let loop_exit_applier = Arc::new(LoopExitApplier::new(
         Arc::clone(&transition_port),
@@ -447,6 +459,7 @@ struct SubagentAwareCapabilityPortFactory {
     inner: Arc<dyn LoopCapabilityPortFactory>,
     spawn_deps: Arc<SubagentSpawnDeps>,
     spawn_id: CapabilityId,
+    spawn_limits: SubagentSpawnLimits,
     prompt_composer: SubagentPromptComposer,
 }
 
@@ -454,6 +467,7 @@ impl SubagentAwareCapabilityPortFactory {
     fn new(
         inner: Arc<dyn LoopCapabilityPortFactory>,
         spawn_deps: SubagentSpawnDeps,
+        spawn_limits: SubagentSpawnLimits,
         prompt_composer: SubagentPromptComposer,
     ) -> Result<Self, DefaultPlannedRuntimeBuildError> {
         let spawn_id =
@@ -463,6 +477,7 @@ impl SubagentAwareCapabilityPortFactory {
             inner,
             spawn_deps: Arc::new(spawn_deps),
             spawn_id,
+            spawn_limits,
             prompt_composer,
         })
     }
@@ -479,7 +494,7 @@ impl LoopCapabilityPortFactory for SubagentAwareCapabilityPortFactory {
             inner,
             run_context.clone(),
             self.spawn_id.clone(),
-            SubagentSpawnLimits::default(),
+            self.spawn_limits,
             Arc::clone(&self.spawn_deps),
         ));
         if run_context.resolved_run_profile.profile_id.as_str() == SUBAGENT_PLANNED_PROFILE_ID {
