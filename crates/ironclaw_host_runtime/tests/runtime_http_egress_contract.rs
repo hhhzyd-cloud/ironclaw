@@ -234,7 +234,7 @@ fn host_http_egress_reuses_staged_secret_for_multiple_targets_in_one_request() {
             scope: scope.clone(),
             capability_id: sample_capability_id(),
             method: NetworkMethod::Post,
-            url: "https://api.example.test/v1/run".to_string(),
+            url: "https://api.example.test/v1/__credential__/run".to_string(),
             headers: vec![],
             body: b"hello".to_vec(),
             network_policy: sample_policy(),
@@ -260,6 +260,16 @@ fn host_http_egress_reuses_staged_secret_for_multiple_targets_in_one_request() {
                     },
                     required: true,
                 },
+                RuntimeCredentialInjection {
+                    handle: handle.clone(),
+                    source: RuntimeCredentialSource::StagedObligation {
+                        capability_id: capability_id.clone(),
+                    },
+                    target: RuntimeCredentialTarget::PathPlaceholder {
+                        placeholder: "__credential__".to_string(),
+                    },
+                    required: true,
+                },
             ],
             response_body_limit: Some(4096),
             timeout_ms: None,
@@ -280,7 +290,7 @@ fn host_http_egress_reuses_staged_secret_for_multiple_targets_in_one_request() {
     );
     assert_eq!(
         requests[0].url,
-        "https://api.example.test/v1/run?token=sk-staged-secret"
+        "https://api.example.test/v1/sk-staged-secret/run?token=sk-staged-secret"
     );
     drop(requests);
 }

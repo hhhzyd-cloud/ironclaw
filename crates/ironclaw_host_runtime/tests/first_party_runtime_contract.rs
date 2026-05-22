@@ -143,11 +143,12 @@ async fn first_party_handler_uses_staged_secret_through_production_host_egress()
         grants: vec![dispatch_grant_with_secret(&handle)],
     });
     let scope = context.resource_scope.clone();
+    let secret_sentinel = "sk-first-party-staged-secret";
     secret_store
         .put(
             scope.clone(),
             handle.clone(),
-            SecretMaterial::from("sk-first-party-staged-secret"),
+            SecretMaterial::from(secret_sentinel),
         )
         .await
         .unwrap();
@@ -171,6 +172,11 @@ async fn first_party_handler_uses_staged_secret_through_production_host_egress()
         panic!("expected completed first-party HTTP fixture, got {outcome:?}");
     };
     assert_eq!(completed.output["status"], json!(200));
+    let public_output = serde_json::to_string(&completed.output).unwrap();
+    assert!(
+        !public_output.contains(secret_sentinel),
+        "first-party public output must not contain staged credential material: {public_output}"
+    );
     let requests = network_recorder.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].url, "https://api.example.test/v1/native");
@@ -181,7 +187,7 @@ async fn first_party_handler_uses_staged_secret_through_production_host_egress()
             .find(|(name, _)| name == "authorization"),
         Some(&(
             "authorization".to_string(),
-            "Bearer sk-first-party-staged-secret".to_string()
+            format!("Bearer {secret_sentinel}")
         ))
     );
 }

@@ -101,7 +101,7 @@ fn production_config(
     if require_wasm_credentials {
         config = config.require_wasm_credentials();
     }
-    config
+    config.require_credential_broker()
 }
 
 async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, RebornBuildError> {
@@ -440,7 +440,7 @@ async fn build_libsql_production(
 ) -> Result<RebornServices, RebornBuildError> {
     use ironclaw_authorization::FilesystemCapabilityLeaseStore;
     use ironclaw_filesystem::LibSqlRootFilesystem;
-    use ironclaw_secrets::FilesystemSecretStore;
+    use ironclaw_secrets::{FilesystemCredentialBroker, FilesystemSecretStore};
 
     let filesystem = Arc::new(LibSqlRootFilesystem::new(Arc::clone(&db)));
     filesystem.run_migrations().await?;
@@ -456,6 +456,10 @@ async fn build_libsql_production(
     let secret_store = Arc::new(FilesystemSecretStore::new(
         Arc::clone(&scoped_filesystem),
         Arc::clone(&secret_crypto),
+    ));
+    let credential_broker = Arc::new(FilesystemCredentialBroker::new(
+        Arc::clone(&scoped_filesystem),
+        secret_crypto,
     ));
 
     let event_store = ironclaw_reborn_event_store::RebornEventStoreConfig::Libsql {
@@ -476,6 +480,7 @@ async fn build_libsql_production(
     .with_first_party_capabilities(Arc::new(builtin_first_party_registry()?))
     .with_capability_leases(leases)
     .with_secret_store(secret_store)
+    .with_credential_broker(credential_broker)
     .try_with_host_http_egress(ironclaw_network::PolicyNetworkHttpEgress::new(
         ironclaw_network::ReqwestNetworkTransport::default(),
     ))?
@@ -511,7 +516,7 @@ async fn build_postgres_production(
 ) -> Result<RebornServices, RebornBuildError> {
     use ironclaw_authorization::FilesystemCapabilityLeaseStore;
     use ironclaw_filesystem::PostgresRootFilesystem;
-    use ironclaw_secrets::FilesystemSecretStore;
+    use ironclaw_secrets::{FilesystemCredentialBroker, FilesystemSecretStore};
 
     let filesystem = Arc::new(PostgresRootFilesystem::new(pool.clone()));
     filesystem.run_migrations().await?;
@@ -527,6 +532,10 @@ async fn build_postgres_production(
     let secret_store = Arc::new(FilesystemSecretStore::new(
         Arc::clone(&scoped_filesystem),
         Arc::clone(&secret_crypto),
+    ));
+    let credential_broker = Arc::new(FilesystemCredentialBroker::new(
+        Arc::clone(&scoped_filesystem),
+        secret_crypto,
     ));
 
     let event_store = ironclaw_reborn_event_store::RebornEventStoreConfig::Postgres { url };
@@ -544,6 +553,7 @@ async fn build_postgres_production(
     .with_first_party_capabilities(Arc::new(builtin_first_party_registry()?))
     .with_capability_leases(leases)
     .with_secret_store(secret_store)
+    .with_credential_broker(credential_broker)
     .try_with_host_http_egress(ironclaw_network::PolicyNetworkHttpEgress::new(
         ironclaw_network::ReqwestNetworkTransport::default(),
     ))?

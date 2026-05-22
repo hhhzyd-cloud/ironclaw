@@ -78,6 +78,9 @@ pub enum RuntimeCredentialTarget {
     QueryParam {
         name: String,
     },
+    PathPlaceholder {
+        placeholder: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

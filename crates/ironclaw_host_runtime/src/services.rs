@@ -61,7 +61,10 @@ use ironclaw_run_state::{
     InMemoryApprovalRequestStore, InMemoryRunStateStore, RunStateApprovalStore, RunStateStore,
 };
 use ironclaw_scripts::{ScriptError, ScriptExecutionRequest, ScriptExecutor, ScriptInvocation};
-use ironclaw_secrets::{InMemorySecretStore, SecretStore};
+use ironclaw_secrets::{
+    CredentialAccountStore, CredentialSessionStore, InMemoryCredentialBroker, InMemorySecretStore,
+    SecretStore,
+};
 use ironclaw_trust::{HostTrustPolicy, TrustPolicy};
 use ironclaw_turns::{
     DefaultTurnCoordinator, FilesystemTurnStateStore, InMemoryTurnStateStore,
@@ -112,6 +115,7 @@ pub struct ProductionWiringConfig {
     required_runtime_backends: Vec<RuntimeKind>,
     require_runtime_http_egress: bool,
     require_wasm_credentials: bool,
+    require_credential_broker: bool,
 }
 
 impl ProductionWiringConfig {
@@ -123,6 +127,7 @@ impl ProductionWiringConfig {
             required_runtime_backends: required_runtime_backends.into_iter().collect(),
             require_runtime_http_egress: false,
             require_wasm_credentials: false,
+            require_credential_broker: false,
         }
     }
 
@@ -133,6 +138,11 @@ impl ProductionWiringConfig {
 
     pub fn require_wasm_credentials(mut self) -> Self {
         self.require_wasm_credentials = true;
+        self
+    }
+
+    pub fn require_credential_broker(mut self) -> Self {
+        self.require_credential_broker = true;
         self
     }
 
@@ -157,6 +167,8 @@ pub enum ProductionWiringComponent {
     EventSink,
     AuditSink,
     SecretStore,
+    CredentialAccountStore,
+    CredentialSessionStore,
     RuntimeHttpEgress,
     RuntimeProcessPort,
     WasmCredentialProvider,
@@ -185,6 +197,8 @@ impl ProductionWiringComponent {
             Self::EventSink => "event_sink",
             Self::AuditSink => "audit_sink",
             Self::SecretStore => "secret_store",
+            Self::CredentialAccountStore => "credential_account_store",
+            Self::CredentialSessionStore => "credential_session_store",
             Self::RuntimeHttpEgress => "runtime_http_egress",
             Self::RuntimeProcessPort => "runtime_process_port",
             Self::WasmCredentialProvider => "wasm_credential_provider",
@@ -266,6 +280,8 @@ struct ProductionComponentTypes {
     event_sink: Option<ProductionComponentType>,
     audit_sink: Option<ProductionComponentType>,
     secret_store: Option<ProductionComponentType>,
+    credential_account_store: Option<ProductionComponentType>,
+    credential_session_store: Option<ProductionComponentType>,
     runtime_http_egress: Option<ProductionComponentType>,
     runtime_http_egress_verified: bool,
     runtime_process_port: ProductionComponentType,
@@ -331,6 +347,7 @@ fn classify_component_type<T: 'static>() -> ProductionImplementationReadiness {
             || type_id == TypeId::of::<InMemoryAuditSink>()
             || type_id == TypeId::of::<InMemoryDurableAuditLog>()
             || type_id == TypeId::of::<InMemorySecretStore>()
+            || type_id == TypeId::of::<InMemoryCredentialBroker>()
             || type_id == TypeId::of::<EmptyWasmRuntimeCredentials>()
             || type_id == TypeId::of::<InMemoryTurnStateStore>()
             || type_id == TypeId::of::<NoopTurnRunWakeNotifier>()
@@ -376,6 +393,8 @@ where
     event_sink: Option<Arc<dyn EventSink>>,
     audit_sink: Option<Arc<dyn AuditSink>>,
     secret_store: Option<Arc<dyn SecretStore>>,
+    credential_account_store: Option<Arc<dyn CredentialAccountStore>>,
+    credential_session_store: Option<Arc<dyn CredentialSessionStore>>,
     network_policy_store: Arc<NetworkObligationPolicyStore>,
     secret_injection_store: Arc<RuntimeSecretInjectionStore>,
     process_lifecycle_store: Arc<ProcessObligationLifecycleStore>,
@@ -435,6 +454,8 @@ where
             event_sink: None,
             audit_sink: None,
             secret_store: None,
+            credential_account_store: None,
+            credential_session_store: None,
             network_policy_store,
             secret_injection_store,
             process_lifecycle_store,
@@ -465,6 +486,8 @@ where
                 event_sink: None,
                 audit_sink: None,
                 secret_store: None,
+                credential_account_store: None,
+                credential_session_store: None,
                 runtime_http_egress: None,
                 runtime_http_egress_verified: false,
                 runtime_process_port: ProductionComponentType::of::<LocalHostProcessPort>(),
@@ -505,6 +528,8 @@ where
             event_sink,
             audit_sink,
             secret_store,
+            credential_account_store,
+            credential_session_store,
             network_policy_store,
             secret_injection_store,
             process_lifecycle_store,
@@ -541,6 +566,8 @@ where
             event_sink,
             audit_sink,
             secret_store,
+            credential_account_store,
+            credential_session_store,
             network_policy_store,
             secret_injection_store,
             process_lifecycle_store,
@@ -598,6 +625,8 @@ where
             event_sink,
             audit_sink,
             secret_store,
+            credential_account_store,
+            credential_session_store,
             network_policy_store,
             secret_injection_store,
             process_lifecycle_store: _,
@@ -644,6 +673,8 @@ where
             event_sink,
             audit_sink,
             secret_store,
+            credential_account_store,
+            credential_session_store,
             network_policy_store,
             secret_injection_store,
             process_lifecycle_store,
@@ -1002,6 +1033,32 @@ where
         self
     }
 
+    pub fn with_credential_account_store<T>(mut self, store: Arc<T>) -> Self
+    where
+        T: CredentialAccountStore + 'static,
+    {
+        self.component_types.credential_account_store = Some(ProductionComponentType::of::<T>());
+        self.credential_account_store = Some(store);
+        self
+    }
+
+    pub fn with_credential_session_store<T>(mut self, store: Arc<T>) -> Self
+    where
+        T: CredentialSessionStore + 'static,
+    {
+        self.component_types.credential_session_store = Some(ProductionComponentType::of::<T>());
+        self.credential_session_store = Some(store);
+        self
+    }
+
+    pub fn with_credential_broker<T>(self, broker: Arc<T>) -> Self
+    where
+        T: CredentialAccountStore + CredentialSessionStore + 'static,
+    {
+        self.with_credential_account_store(Arc::clone(&broker))
+            .with_credential_session_store(broker)
+    }
+
     pub fn with_runtime_http_egress<T>(mut self, runtime_http_egress: Arc<T>) -> Self
     where
         T: RuntimeHttpEgress + 'static,
@@ -1254,6 +1311,18 @@ where
             ProductionWiringComponent::SecretStore,
             self.secret_store.is_some(),
         );
+        if config.require_credential_broker {
+            self.push_missing(
+                &mut issues,
+                ProductionWiringComponent::CredentialAccountStore,
+                self.credential_account_store.is_some(),
+            );
+            self.push_missing(
+                &mut issues,
+                ProductionWiringComponent::CredentialSessionStore,
+                self.credential_session_store.is_some(),
+            );
+        }
 
         if config.require_runtime_http_egress {
             let runtime_http_configured =
@@ -1441,6 +1510,16 @@ where
             &mut issues,
             ProductionWiringComponent::SecretStore,
             self.component_types.secret_store,
+        );
+        self.push_local_only(
+            &mut issues,
+            ProductionWiringComponent::CredentialAccountStore,
+            self.component_types.credential_account_store,
+        );
+        self.push_local_only(
+            &mut issues,
+            ProductionWiringComponent::CredentialSessionStore,
+            self.component_types.credential_session_store,
         );
         self.push_local_only(
             &mut issues,
