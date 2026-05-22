@@ -33,8 +33,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use pending_gate_projection::{
-    PENDING_GATE_PROJECTION_CONSUMER_ID, PendingGateProjection, PendingGateProjectionCursorStore,
-    PendingGateProjectionGateKind, PendingGateProjectionKey, PendingGateProjectionReplay,
+    PENDING_GATE_PROJECTION_CONSUMER_ID, PendingGateKind, PendingGateProjection,
+    PendingGateProjectionCursorStore, PendingGateProjectionKey, PendingGateProjectionReplay,
     PendingGateProjectionRow, PendingGateProjectionSink,
 };
 
@@ -292,6 +292,13 @@ pub enum ProjectionError {
         // happy path. Construction sites use `Box::new(..)`.
         requested: Box<ProjectionCursor>,
         earliest: Box<ProjectionCursor>,
+    },
+    #[error(
+        "turn event projection rebase required: requested turn cursor {requested:?} cannot replay from earliest retained turn cursor {earliest:?}"
+    )]
+    TurnEventRebaseRequired {
+        requested: ironclaw_turns::EventCursor,
+        earliest: ironclaw_turns::EventCursor,
     },
     #[error("projection source failed during {operation}")]
     Source { operation: &'static str },
