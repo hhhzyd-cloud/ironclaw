@@ -8,7 +8,10 @@ use ironclaw_host_api::{
     RuntimeProfile, SecretMode,
     runtime_policy::{ApprovalPolicy, EffectiveRuntimePolicy},
 };
-use ironclaw_host_runtime::{CapabilitySurfaceVersion, ProductionWiringConfig};
+use ironclaw_host_runtime::{
+    CapabilitySurfaceVersion, ProductionWiringComponent, ProductionWiringConfig,
+    ProductionWiringIssueKind,
+};
 use ironclaw_reborn_composition::{
     PostgresProductionSubstrateConfig, RebornCompositionError,
     build_postgres_production_host_runtime_services,
@@ -70,7 +73,56 @@ async fn postgres_substrate_builder_rejects_missing_secret_master_key() {
     ));
 }
 
+#[tokio::test]
+async fn postgres_substrate_builder_preserves_runtime_policy_guardrails() {
+    let Some((_container, pool, database_url)) = postgres_pool_or_skip().await else {
+        return;
+    };
+
+    let services =
+        build_postgres_production_host_runtime_services(PostgresProductionSubstrateConfig {
+            pool,
+            event_store: RebornEventStoreConfig::Postgres {
+                url: SecretString::from(database_url),
+            },
+            secret_master_key: Some(SecretString::from("01234567890123456789012345678901")),
+            trust_policy: Arc::new(ironclaw_trust::HostTrustPolicy::fail_closed()),
+            runtime_policy: local_only_runtime_policy(),
+            turn_run_wake_notifier: Arc::new(RecordingSchedulerWakeNotifier),
+            surface_version: CapabilitySurfaceVersion::new("test-surface").unwrap(),
+        })
+        .await
+        .unwrap();
+
+    let production_config = ProductionWiringConfig::new([]).require_runtime_http_egress();
+    let report = services
+        .validate_production_wiring(&production_config)
+        .expect_err("local-only runtime policy must not be normalized into production wiring");
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::RuntimePolicy,
+            ProductionWiringIssueKind::LocalOnlyImplementation,
+        ),
+        "postgres substrate builder should preserve runtime policy guardrails: {report:?}"
+    );
+}
+
 fn production_runtime_policy() -> EffectiveRuntimePolicy {
+    EffectiveRuntimePolicy {
+        deployment: DeploymentMode::HostedMultiTenant,
+        requested_profile: RuntimeProfile::HostedDev,
+        resolved_profile: RuntimeProfile::HostedDev,
+        filesystem_backend: FilesystemBackendKind::TenantWorkspace,
+        process_backend: ProcessBackendKind::TenantSandbox,
+        network_mode: NetworkMode::Allowlist,
+        secret_mode: SecretMode::TenantBroker,
+        approval_policy: ApprovalPolicy::AskDestructive,
+        audit_mode: AuditMode::Standard,
+    }
+}
+
+fn local_only_runtime_policy() -> EffectiveRuntimePolicy {
     EffectiveRuntimePolicy {
         deployment: DeploymentMode::LocalSingleUser,
         requested_profile: RuntimeProfile::LocalDev,

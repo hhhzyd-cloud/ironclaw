@@ -170,13 +170,7 @@ pub fn reborn_runtime_readiness_snapshot() -> RebornRuntimeReadinessSnapshot {
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use std::sync::Arc;
 
-#[cfg(any(feature = "libsql", feature = "postgres"))]
-use async_trait::async_trait;
 use ironclaw_authorization::CapabilityLeaseError;
-#[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_authorization::{FilesystemCapabilityLeaseStore, GrantAuthorizer};
-#[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_extensions::ExtensionRegistry;
 #[cfg(feature = "libsql")]
 use ironclaw_filesystem::LibSqlRootFilesystem;
 #[cfg(feature = "postgres")]
@@ -185,28 +179,23 @@ use ironclaw_filesystem::PostgresRootFilesystem;
 use ironclaw_filesystem::{RootFilesystem, ScopedFilesystem};
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_host_api::{
-    MountAlias, MountGrant, MountPermissions, MountView, ResourceScope, SecretHandle, VirtualPath,
+    MountAlias, MountGrant, MountPermissions, MountView, ResourceScope, VirtualPath,
     runtime_policy::EffectiveRuntimePolicy,
 };
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_host_runtime::{CapabilitySurfaceVersion, HostRuntimeServices};
 #[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_network::{PolicyNetworkHttpEgress, ReqwestNetworkTransport};
+use ironclaw_processes::{FilesystemProcessResultStore, FilesystemProcessStore};
 #[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_processes::{FilesystemProcessResultStore, FilesystemProcessStore, ProcessServices};
+use ironclaw_reborn_event_store::RebornEventStoreConfig;
 use ironclaw_reborn_event_store::RebornEventStoreError;
-#[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_reborn_event_store::{RebornEventStoreConfig, RebornProfile};
 use ironclaw_resources::ResourceError;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_resources::{FilesystemResourceGovernorStore, PersistentResourceGovernor};
 use ironclaw_run_state::RunStateError;
 use ironclaw_secrets::SecretError;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_secrets::{
-    FilesystemSecretStore, SecretLease, SecretLeaseId, SecretMaterial, SecretMetadata, SecretStore,
-    SecretStoreError, SecretsCrypto,
-};
+use ironclaw_secrets::SecretMaterial;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_trust::TrustPolicy;
 use ironclaw_turns::TurnError;
@@ -365,6 +354,16 @@ pub enum RebornCompositionError {
     Turn(#[from] TurnError),
     #[error("reborn run-profile resolver substrate failed: {0}")]
     RunProfile(#[from] ironclaw_turns::run_profile::RunProfileRegistryError),
+    #[error("reborn production wiring failed")]
+    ProductionWiring {
+        report: ironclaw_host_runtime::ProductionWiringReport,
+    },
+}
+
+impl From<ironclaw_host_runtime::ProductionWiringReport> for RebornCompositionError {
+    fn from(report: ironclaw_host_runtime::ProductionWiringReport) -> Self {
+        Self::ProductionWiring { report }
+    }
 }
 
 /// Build production-wired host-runtime services over libSQL-backed substrates.
@@ -384,55 +383,7 @@ where
     TPolicy: TrustPolicy + 'static,
     TWake: TurnRunWakeNotifier + 'static,
 {
-    let filesystem = Arc::new(LibSqlRootFilesystem::new(Arc::clone(&config.database)));
-    filesystem.run_migrations().await?;
-
-    let scoped_filesystem = wrap_scoped(Arc::clone(&filesystem));
-    let process_services = ProcessServices::filesystem(Arc::clone(&scoped_filesystem));
-
-    let secret_store =
-        build_filesystem_secret_store(Arc::clone(&scoped_filesystem), config.secret_master_key)
-            .await?;
-
-    let resource_store = FilesystemResourceGovernorStore::new(Arc::clone(&scoped_filesystem));
-    let governor = Arc::new(PersistentResourceGovernor::new(resource_store));
-
-    let capability_leases = Arc::new(FilesystemCapabilityLeaseStore::new(Arc::clone(
-        &scoped_filesystem,
-    )));
-
-    let services = HostRuntimeServices::new(
-        Arc::new(ExtensionRegistry::new()),
-        filesystem,
-        governor,
-        Arc::new(GrantAuthorizer::new()),
-        process_services,
-        config.surface_version,
-    )
-    .with_trust_policy(config.trust_policy)
-    .with_runtime_policy(config.runtime_policy)
-    .with_capability_leases(capability_leases)
-    .with_secret_store(Arc::clone(&secret_store))
-    .with_turn_run_wake_notifier(config.turn_run_wake_notifier)
-    .with_filesystem_run_state(Arc::clone(&scoped_filesystem))
-    .with_filesystem_turn_state_store(Arc::clone(&scoped_filesystem))
-    .with_run_profile_resolver(Arc::new(
-        ironclaw_reborn::planned_driver_factory::default_planned_run_profile_resolver()?,
-    ))
-    .with_reborn_event_store_config(RebornProfile::Production, config.event_store)
-    .await?;
-
-    // safety: `with_secret_store` is called unconditionally above on the same
-    // builder chain, so `try_with_host_http_egress` can only return a
-    // `Missing(SecretStore)` wiring report if the host-runtime builder API
-    // regresses; treat that as infallible here.
-    let services = services
-        .try_with_host_http_egress(PolicyNetworkHttpEgress::new(
-            ReqwestNetworkTransport::default(),
-        ))
-        .expect("secret_store wired above guarantees host HTTP egress is buildable"); // safety: see comment above
-
-    Ok(services)
+    factory::build_libsql_production_host_runtime_services(config).await
 }
 
 /// Build production-wired host-runtime services over PostgreSQL-backed substrates.
@@ -449,160 +400,7 @@ where
     TPolicy: TrustPolicy + 'static,
     TWake: TurnRunWakeNotifier + 'static,
 {
-    let filesystem = Arc::new(PostgresRootFilesystem::new(config.pool.clone()));
-    filesystem.run_migrations().await?;
-
-    let scoped_filesystem = wrap_scoped(Arc::clone(&filesystem));
-    let process_services = ProcessServices::filesystem(Arc::clone(&scoped_filesystem));
-
-    let secret_store =
-        build_filesystem_secret_store(Arc::clone(&scoped_filesystem), config.secret_master_key)
-            .await?;
-
-    let resource_store = FilesystemResourceGovernorStore::new(Arc::clone(&scoped_filesystem));
-    let governor = Arc::new(PersistentResourceGovernor::new(resource_store));
-
-    let capability_leases = Arc::new(FilesystemCapabilityLeaseStore::new(Arc::clone(
-        &scoped_filesystem,
-    )));
-
-    let services = HostRuntimeServices::new(
-        Arc::new(ExtensionRegistry::new()),
-        filesystem,
-        governor,
-        Arc::new(GrantAuthorizer::new()),
-        process_services,
-        config.surface_version,
-    )
-    .with_trust_policy(config.trust_policy)
-    .with_runtime_policy(config.runtime_policy)
-    .with_capability_leases(capability_leases)
-    .with_secret_store(Arc::clone(&secret_store))
-    .with_turn_run_wake_notifier(config.turn_run_wake_notifier)
-    .with_filesystem_run_state(Arc::clone(&scoped_filesystem))
-    .with_filesystem_turn_state_store(Arc::clone(&scoped_filesystem))
-    .with_run_profile_resolver(Arc::new(
-        ironclaw_reborn::planned_driver_factory::default_planned_run_profile_resolver()?,
-    ))
-    .with_reborn_event_store_config(RebornProfile::Production, config.event_store)
-    .await?;
-
-    // safety: `with_secret_store` is called unconditionally above on the same
-    // builder chain, so `try_with_host_http_egress` can only return a
-    // `Missing(SecretStore)` wiring report if the host-runtime builder API
-    // regresses; treat that as infallible here.
-    let services = services
-        .try_with_host_http_egress(PolicyNetworkHttpEgress::new(
-            ReqwestNetworkTransport::default(),
-        ))
-        .expect("secret_store wired above guarantees host HTTP egress is buildable"); // safety: see comment above
-
-    Ok(services)
-}
-
-/// Build the per-process [`SecretStore`] over the shared
-/// [`ScopedFilesystem`].
-///
-/// Backend selection is now a property of the underlying
-/// [`RootFilesystem`] (libSQL/Postgres/in-memory), not of the secret store
-/// itself — see "Legacy per-backend store cleanup" in
-/// `docs/plans/2026-05-16-scoped-filesystem-tenant-isolation.md`. The
-/// startup readiness check
-/// ([`FilesystemSecretStore::verify_can_decrypt_existing_secrets`])
-/// preserves the same fail-loud-on-master-key-mismatch contract the deleted
-/// libSQL/Postgres backends carried.
-#[cfg(any(feature = "libsql", feature = "postgres"))]
-async fn build_filesystem_secret_store<F>(
-    scoped_filesystem: Arc<ScopedFilesystem<F>>,
-    master_key: Option<SecretMaterial>,
-) -> Result<Arc<SharedSecretStore>, RebornCompositionError>
-where
-    F: RootFilesystem + 'static,
-{
-    let crypto = secrets_crypto(master_key)?;
-    let store = FilesystemSecretStore::new(scoped_filesystem, crypto);
-    // The FS-stored master-key sentinel was removed alongside the tenant-aware
-    // ScopedFilesystem rework — see filesystem_store.rs. Master-key
-    // correctness is verified on first per-tenant decrypt op.
-    let store: Arc<dyn SecretStore> = Arc::new(store);
-    Ok(Arc::new(SharedSecretStore::new(store)))
-}
-
-#[cfg(any(feature = "libsql", feature = "postgres"))]
-fn secrets_crypto(
-    master_key: Option<SecretMaterial>,
-) -> Result<Arc<SecretsCrypto>, RebornCompositionError> {
-    let master_key = master_key.ok_or(RebornCompositionError::MissingSecretMasterKey)?;
-    Ok(Arc::new(SecretsCrypto::new(master_key)?))
-}
-
-// TODO(#3571): remove this adapter when the host-runtime services builder
-// accepts `Arc<dyn SecretStore>` directly. Until then, this newtype lets the
-// composition root pass a single concrete `SecretStore` impl to both the
-// substrate wiring and any future per-store adapters.
-#[cfg(any(feature = "libsql", feature = "postgres"))]
-#[derive(Clone)]
-struct SharedSecretStore {
-    inner: Arc<dyn SecretStore>,
-}
-
-#[cfg(any(feature = "libsql", feature = "postgres"))]
-impl SharedSecretStore {
-    fn new(inner: Arc<dyn SecretStore>) -> Self {
-        Self { inner }
-    }
-}
-
-#[cfg(any(feature = "libsql", feature = "postgres"))]
-#[async_trait]
-impl SecretStore for SharedSecretStore {
-    async fn put(
-        &self,
-        scope: ResourceScope,
-        handle: SecretHandle,
-        material: SecretMaterial,
-    ) -> Result<SecretMetadata, SecretStoreError> {
-        self.inner.put(scope, handle, material).await
-    }
-
-    async fn metadata(
-        &self,
-        scope: &ResourceScope,
-        handle: &SecretHandle,
-    ) -> Result<Option<SecretMetadata>, SecretStoreError> {
-        self.inner.metadata(scope, handle).await
-    }
-
-    async fn lease_once(
-        &self,
-        scope: &ResourceScope,
-        handle: &SecretHandle,
-    ) -> Result<SecretLease, SecretStoreError> {
-        self.inner.lease_once(scope, handle).await
-    }
-
-    async fn consume(
-        &self,
-        scope: &ResourceScope,
-        lease_id: SecretLeaseId,
-    ) -> Result<SecretMaterial, SecretStoreError> {
-        self.inner.consume(scope, lease_id).await
-    }
-
-    async fn revoke(
-        &self,
-        scope: &ResourceScope,
-        lease_id: SecretLeaseId,
-    ) -> Result<SecretLease, SecretStoreError> {
-        self.inner.revoke(scope, lease_id).await
-    }
-
-    async fn leases_for_scope(
-        &self,
-        scope: &ResourceScope,
-    ) -> Result<Vec<SecretLease>, SecretStoreError> {
-        self.inner.leases_for_scope(scope).await
-    }
+    factory::build_postgres_production_host_runtime_services(config).await
 }
 
 #[cfg(all(test, any(feature = "libsql", feature = "postgres")))]
@@ -797,6 +595,7 @@ mod two_tenant_isolation_tests {
     use super::*;
     use ironclaw_filesystem::InMemoryBackend;
     use ironclaw_host_api::{AgentId, InvocationId, ProjectId, SecretHandle, TenantId, UserId};
+    use ironclaw_secrets::{FilesystemSecretStore, SecretStore, SecretsCrypto};
     use secrecy::ExposeSecret;
 
     fn scope(tenant: &str, user: &str) -> ResourceScope {

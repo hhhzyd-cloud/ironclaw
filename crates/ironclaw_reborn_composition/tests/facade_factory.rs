@@ -3,21 +3,20 @@ use std::collections::BTreeMap;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use std::sync::Arc;
 
-#[cfg(any(feature = "libsql", feature = "postgres"))]
+#[cfg(feature = "libsql")]
 use chrono::Utc;
 #[cfg(feature = "postgres")]
 use deadpool_postgres::tokio_postgres;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_host_api::{
-    AgentId, AuditMode, DeploymentMode, EffectKind, FilesystemBackendKind, NetworkMode, PackageId,
-    ProcessBackendKind, ProjectId, RuntimeKind, RuntimeProfile, SecretMode, TenantId, ThreadId,
-    UserId,
+    AuditMode, DeploymentMode, EffectKind, FilesystemBackendKind, NetworkMode, PackageId,
+    ProcessBackendKind, RuntimeKind, RuntimeProfile, SecretMode,
     runtime_policy::{ApprovalPolicy, EffectiveRuntimePolicy},
 };
 #[cfg(feature = "libsql")]
 use ironclaw_host_api::{
     CapabilityGrant, CapabilityGrantId, CapabilityId, CapabilitySet, ExecutionContext, ExtensionId,
-    GrantConstraints, MountView, NetworkPolicy, Principal, TrustClass,
+    GrantConstraints, MountView, NetworkPolicy, Principal, TrustClass, UserId,
 };
 #[cfg(feature = "libsql")]
 use ironclaw_host_runtime::{CapabilitySurfacePolicy, SurfaceKind, VisibleCapabilityRequest};
@@ -27,10 +26,6 @@ use ironclaw_host_runtime::{
     TurnRunSchedulerConfig, TurnRunSchedulerHandle,
 };
 #[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_reborn::planned_driver_factory::PLANNED_DEFAULT_PROFILE_ID;
-#[cfg(all(feature = "postgres", not(feature = "libsql")))]
-use ironclaw_reborn_composition::RebornCompositionProfile;
-#[cfg(feature = "libsql")]
 use ironclaw_reborn_composition::{RebornBuildError, RebornCompositionProfile};
 use ironclaw_reborn_composition::{RebornBuildInput, RebornReadinessState, build_reborn_services};
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -41,9 +36,7 @@ use ironclaw_trust::{AdminConfig, AdminEntry, HostTrustAssignment, HostTrustPoli
 use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_turns::{
-    AcceptedMessageRef, IdempotencyKey, InMemoryTurnStateStore, ReplyTargetBindingRef,
-    RunProfileRequest, SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse, TurnActor,
-    TurnScope,
+    InMemoryTurnStateStore,
     runner::{ClaimedTurnRun, TurnRunTransitionPort},
 };
 
@@ -208,25 +201,6 @@ async fn libsql_db_at(path: impl AsRef<std::path::Path>) -> Arc<libsql::Database
             .await
             .unwrap(),
     )
-}
-
-#[cfg(any(feature = "libsql", feature = "postgres"))]
-fn submit_turn_request(thread: &str, idempotency_key: &str) -> SubmitTurnRequest {
-    SubmitTurnRequest {
-        scope: TurnScope::new(
-            TenantId::new("tenant1").unwrap(),
-            Some(AgentId::new("agent1").unwrap()),
-            Some(ProjectId::new("project1").unwrap()),
-            ThreadId::new(thread).unwrap(),
-        ),
-        actor: TurnActor::new(UserId::new("user1").unwrap()),
-        accepted_message_ref: AcceptedMessageRef::new(format!("message-{thread}")).unwrap(),
-        source_binding_ref: SourceBindingRef::new("source-web").unwrap(),
-        reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web").unwrap(),
-        requested_run_profile: Some(RunProfileRequest::new("default").unwrap()),
-        idempotency_key: IdempotencyKey::new(idempotency_key).unwrap(),
-        received_at: Utc::now(),
-    }
 }
 
 #[cfg(feature = "postgres")]
@@ -540,13 +514,13 @@ async fn production_rejects_memory_libsql_event_store() {
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
-async fn production_libsql_services_wire_first_party_runtime_http_egress() {
+async fn production_libsql_services_require_process_port_for_first_party_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("reborn.db");
     let db = libsql_db_at(&db_path).await;
     let (notifier, handle) = live_wake_notifier();
 
-    let services = build_reborn_services(
+    let result = build_reborn_services(
         RebornBuildInput::libsql(
             RebornCompositionProfile::Production,
             "test-owner",
@@ -561,38 +535,31 @@ async fn production_libsql_services_wire_first_party_runtime_http_egress() {
         .with_required_runtime_backends([RuntimeKind::FirstParty])
         .require_runtime_http_egress(),
     )
-    .await
-    .unwrap();
-
-    let health = services
-        .host_runtime
-        .as_ref()
-        .expect("production must expose host runtime")
-        .health()
-        .await
-        .unwrap();
+    .await;
 
     handle.shutdown().await;
 
-    assert_eq!(
-        services.readiness.state,
-        RebornReadinessState::ProductionValidated
-    );
+    let Err(RebornBuildError::ProductionWiring { report }) = result else {
+        panic!("expected production first-party runtime to require a process port, got {result:?}");
+    };
     assert!(
-        health.ready,
-        "first-party runtime and production HTTP egress should satisfy production wiring: {health:?}"
+        report.contains(
+            ironclaw_host_runtime::ProductionWiringComponent::RuntimeProcessPort,
+            ironclaw_host_runtime::ProductionWiringIssueKind::Missing,
+        ),
+        "first-party shell capability should keep production wiring fail-closed until a tenant sandbox process port is configured: {report:?}"
     );
 }
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
-async fn production_postgres_services_wire_first_party_runtime_http_egress() {
+async fn production_postgres_services_require_process_port_for_first_party_runtime() {
     let Some((_container, pool, database_url)) = postgres_pool_or_skip().await else {
         return;
     };
     let (notifier, handle) = live_wake_notifier();
 
-    let services = build_reborn_services(
+    let result = build_reborn_services(
         RebornBuildInput::postgres(
             RebornCompositionProfile::Production,
             "test-owner",
@@ -606,38 +573,33 @@ async fn production_postgres_services_wire_first_party_runtime_http_egress() {
         .with_required_runtime_backends([RuntimeKind::FirstParty])
         .require_runtime_http_egress(),
     )
-    .await
-    .unwrap();
-
-    let health = services
-        .host_runtime
-        .as_ref()
-        .expect("production must expose host runtime")
-        .health()
-        .await
-        .unwrap();
+    .await;
 
     handle.shutdown().await;
 
-    assert_eq!(
-        services.readiness.state,
-        RebornReadinessState::ProductionValidated
-    );
+    let Err(RebornBuildError::ProductionWiring { report }) = result else {
+        panic!(
+            "expected postgres production first-party runtime to require a process port, got {result:?}"
+        );
+    };
     assert!(
-        health.ready,
-        "first-party runtime and production HTTP egress should satisfy Postgres production wiring: {health:?}"
+        report.contains(
+            ironclaw_host_runtime::ProductionWiringComponent::RuntimeProcessPort,
+            ironclaw_host_runtime::ProductionWiringIssueKind::Missing,
+        ),
+        "postgres first-party shell capability should keep production wiring fail-closed until a tenant sandbox process port is configured: {report:?}"
     );
 }
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
-async fn migration_dry_run_validates_libsql_shape() {
+async fn migration_dry_run_requires_libsql_process_port_for_first_party_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("reborn.db");
     let db = libsql_db_at(&db_path).await;
     let (notifier, handle) = live_wake_notifier();
 
-    let services = build_reborn_services(
+    let result = build_reborn_services(
         RebornBuildInput::libsql(
             RebornCompositionProfile::MigrationDryRun,
             "test-owner",
@@ -650,44 +612,31 @@ async fn migration_dry_run_validates_libsql_shape() {
         .with_runtime_policy(production_runtime_policy())
         .with_turn_run_wake_notifier(notifier),
     )
-    .await
-    .unwrap();
-
-    let response = services
-        .turn_coordinator
-        .as_ref()
-        .expect("migration dry-run must expose turn coordinator")
-        .submit_turn(submit_turn_request(
-            "thread-planned-profile",
-            "idem-planned-profile",
-        ))
-        .await
-        .unwrap();
-    let SubmitTurnResponse::Accepted {
-        resolved_run_profile_id,
-        ..
-    } = response;
-    assert_eq!(resolved_run_profile_id.as_str(), PLANNED_DEFAULT_PROFILE_ID);
+    .await;
 
     handle.shutdown().await;
 
-    assert_eq!(
-        services.readiness.state,
-        RebornReadinessState::MigrationDryRunValidated
+    let Err(RebornBuildError::ProductionWiring { report }) = result else {
+        panic!("expected migration dry-run to require a process port, got {result:?}");
+    };
+    assert!(
+        report.contains(
+            ironclaw_host_runtime::ProductionWiringComponent::RuntimeProcessPort,
+            ironclaw_host_runtime::ProductionWiringIssueKind::Missing,
+        ),
+        "migration dry-run should keep production-shaped first-party wiring fail-closed until a tenant sandbox process port is configured: {report:?}"
     );
-    assert!(services.host_runtime.is_some());
-    assert!(services.turn_coordinator.is_some());
 }
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
-async fn migration_dry_run_validates_postgres_planned_turn_profile() {
+async fn migration_dry_run_requires_postgres_process_port_for_first_party_runtime() {
     let Some((_container, pool, database_url)) = postgres_pool_or_skip().await else {
         return;
     };
     let (notifier, handle) = live_wake_notifier();
 
-    let services = build_reborn_services(
+    let result = build_reborn_services(
         RebornBuildInput::postgres(
             RebornCompositionProfile::MigrationDryRun,
             "test-owner",
@@ -699,31 +648,18 @@ async fn migration_dry_run_validates_postgres_planned_turn_profile() {
         .with_runtime_policy(production_runtime_policy())
         .with_turn_run_wake_notifier(notifier),
     )
-    .await
-    .unwrap();
-
-    let response = services
-        .turn_coordinator
-        .as_ref()
-        .expect("migration dry-run must expose turn coordinator")
-        .submit_turn(submit_turn_request(
-            "thread-postgres-planned-profile",
-            "idem-postgres-planned-profile",
-        ))
-        .await
-        .unwrap();
-    let SubmitTurnResponse::Accepted {
-        resolved_run_profile_id,
-        ..
-    } = response;
-    assert_eq!(resolved_run_profile_id.as_str(), PLANNED_DEFAULT_PROFILE_ID);
+    .await;
 
     handle.shutdown().await;
 
-    assert_eq!(
-        services.readiness.state,
-        RebornReadinessState::MigrationDryRunValidated
+    let Err(RebornBuildError::ProductionWiring { report }) = result else {
+        panic!("expected postgres migration dry-run to require a process port, got {result:?}");
+    };
+    assert!(
+        report.contains(
+            ironclaw_host_runtime::ProductionWiringComponent::RuntimeProcessPort,
+            ironclaw_host_runtime::ProductionWiringIssueKind::Missing,
+        ),
+        "postgres migration dry-run should keep production-shaped first-party wiring fail-closed until a tenant sandbox process port is configured: {report:?}"
     );
-    assert!(services.host_runtime.is_some());
-    assert!(services.turn_coordinator.is_some());
 }
