@@ -273,6 +273,13 @@ impl EventProjectionService for FailingUpdatesProjectionService {
                 requested: requested.clone(),
                 earliest: earliest.clone(),
             },
+            ProjectionError::TurnEventRebaseRequired {
+                requested,
+                earliest,
+            } => ProjectionError::TurnEventRebaseRequired {
+                requested: *requested,
+                earliest: *earliest,
+            },
             ProjectionError::Source { operation } => ProjectionError::Source { operation },
         };
         Err(error)
@@ -299,6 +306,13 @@ impl EventProjectionService for FailingSnapshotProjectionService {
             } => ProjectionError::RebaseRequired {
                 requested: requested.clone(),
                 earliest: earliest.clone(),
+            },
+            ProjectionError::TurnEventRebaseRequired {
+                requested,
+                earliest,
+            } => ProjectionError::TurnEventRebaseRequired {
+                requested: *requested,
+                earliest: *earliest,
             },
             ProjectionError::Source { operation } => ProjectionError::Source { operation },
         })
