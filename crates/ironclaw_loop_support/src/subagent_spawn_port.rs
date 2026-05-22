@@ -517,8 +517,8 @@ impl SubagentSpawnCapabilityPort {
         let gate_ref = match gate_override {
             Some(gate_ref) => gate_ref,
             None => GateRef::new(match mode {
-                SpawnSubagentMode::Blocking => format!("gate:subagent.{child_run_id}"),
-                SpawnSubagentMode::Background => format!("gate:subagent-bg.{child_run_id}"),
+                SpawnSubagentMode::Blocking => format!("gate:subagent-{child_run_id}"),
+                SpawnSubagentMode::Background => format!("gate:subagent-bg-{child_run_id}"),
             })
             .map_err(invalid_static_ref)?,
         };
@@ -785,7 +785,7 @@ impl LoopCapabilityPort for SubagentSpawnCapabilityPort {
             .count();
         let batch_blocking_gate = if spawn_count > 1 {
             Some(
-                GateRef::new(format!("gate:subagent-batch.{}", TurnRunId::new()))
+                GateRef::new(format!("gate:subagent-batch-{}", TurnRunId::new()))
                     .map_err(invalid_static_ref)?,
             )
         } else {
@@ -808,9 +808,21 @@ impl LoopCapabilityPort for SubagentSpawnCapabilityPort {
                         .flatten();
                     self.handle_spawn_with_gate(args, gate_override).await?
                 };
+                // GateRef and LoopGateRef are distinct newtypes that share
+                // the same string representation by design (one names the
+                // host gate, the other names the loop-visible projection of
+                // the same gate). They have no cross-type PartialEq, so the
+                // batch-coalesced check compares their string forms.
+                let batch_await_dependent = matches!(
+                    &outcome,
+                    CapabilityOutcome::AwaitDependentRun { gate_ref, .. }
+                        if batch_blocking_gate
+                            .as_ref()
+                            .is_some_and(|batch_gate| batch_gate.as_str() == gate_ref.as_str())
+                );
                 let suspended = outcome.is_suspension();
                 outcomes.push(outcome);
-                if suspended && request.stop_on_first_suspension && batch_blocking_gate.is_none() {
+                if suspended && request.stop_on_first_suspension && !batch_await_dependent {
                     return Ok(CapabilityBatchOutcome {
                         outcomes,
                         stopped_on_suspension: true,

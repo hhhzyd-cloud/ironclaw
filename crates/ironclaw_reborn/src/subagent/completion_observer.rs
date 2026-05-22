@@ -1,4 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashSet,
+    sync::{Arc, OnceLock},
+};
 
 use async_trait::async_trait;
 use ironclaw_host_api::CapabilityId;
@@ -119,6 +122,7 @@ where
         states: Vec<crate::subagent::gate_resolution::AwaitedChildState>,
     ) -> Result<(), TurnError> {
         let mut delivered_gates = Vec::new();
+        let mut parent_resume_gates = HashSet::new();
         let mut parent_resumes = Vec::new();
         for state in states {
             let terminal_event = state.terminal_event.ok_or_else(|| TurnError::Unavailable {
@@ -128,11 +132,7 @@ where
                 SpawnSubagentMode::Blocking => {
                     self.write_terminal_result(&state.record, &terminal_event)
                         .await?;
-                    if !parent_resumes.iter().any(
-                        |(record, _): &(AwaitedChildSetRecord, AwaitedChildTerminalEvent)| {
-                            record.gate_ref == state.record.gate_ref
-                        },
-                    ) {
+                    if parent_resume_gates.insert(state.record.gate_ref.clone()) {
                         parent_resumes.push((state.record.clone(), terminal_event.clone()));
                     }
                 }
@@ -597,8 +597,8 @@ fn awaited_child_record_from_persisted(
     metadata: SubagentThreadMetadata,
 ) -> Result<AwaitedChildSetRecord, TurnError> {
     let gate_ref = GateRef::new(match metadata.mode {
-        SpawnSubagentMode::Blocking => format!("gate:subagent.{}", child_record.run_id),
-        SpawnSubagentMode::Background => format!("gate:subagent-bg.{}", child_record.run_id),
+        SpawnSubagentMode::Blocking => format!("gate:subagent-{}", child_record.run_id),
+        SpawnSubagentMode::Background => format!("gate:subagent-bg-{}", child_record.run_id),
     })
     .map_err(|reason| TurnError::InvalidRequest { reason })?;
     let parent_run_context = LoopRunContext::new(
@@ -1081,7 +1081,7 @@ mod tests {
         parent_run_context.run_id = parent_run_id;
         gate_store
             .record_awaited_child(AwaitedChildSetRecord {
-                gate_ref: GateRef::new("gate:subagent-bg:test").unwrap(),
+                gate_ref: GateRef::new("gate:subagent-bg-test").unwrap(),
                 parent_run_context,
                 parent_scope: parent_scope.clone(),
                 parent_run_id,
@@ -1232,7 +1232,7 @@ mod tests {
         parent_run_context.run_id = parent_run_id;
         gate_store
             .record_awaited_child(AwaitedChildSetRecord {
-                gate_ref: GateRef::new("gate:subagent-bg:recovered").unwrap(),
+                gate_ref: GateRef::new("gate:subagent-bg-recovered").unwrap(),
                 parent_run_context,
                 parent_scope: parent_scope.clone(),
                 parent_run_id,
@@ -1375,7 +1375,7 @@ mod tests {
         parent_run_context.run_id = parent_run_id;
         gate_store
             .record_awaited_child(AwaitedChildSetRecord {
-                gate_ref: GateRef::new("gate:subagent-bg:recovery-required").unwrap(),
+                gate_ref: GateRef::new("gate:subagent-bg-recovery-required").unwrap(),
                 parent_run_context,
                 parent_scope: parent_scope.clone(),
                 parent_run_id,
