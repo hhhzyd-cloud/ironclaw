@@ -268,6 +268,7 @@ impl CapabilityStage {
                             call,
                             kind: GateKind::Approval,
                             gate_ref,
+                            resolved_result: None,
                         },
                     )
                     .await
@@ -281,6 +282,7 @@ impl CapabilityStage {
                             call,
                             kind: GateKind::Auth,
                             gate_ref,
+                            resolved_result: None,
                         },
                     )
                     .await
@@ -294,11 +296,21 @@ impl CapabilityStage {
                             call,
                             kind: GateKind::Resource,
                             gate_ref,
+                            resolved_result: None,
                         },
                     )
                     .await
             }
-            CapabilityOutcome::AwaitDependentRun { gate_ref, .. } => {
+            CapabilityOutcome::AwaitDependentRun {
+                gate_ref,
+                result_ref,
+                safe_summary,
+            } => {
+                let resolved_result = CapabilityResultMessage {
+                    result_ref,
+                    safe_summary,
+                    terminate_hint: false,
+                };
                 GateStage
                     .process(
                         ctx,
@@ -307,6 +319,7 @@ impl CapabilityStage {
                             call,
                             kind: GateKind::AwaitDependentRun,
                             gate_ref,
+                            resolved_result: Some(resolved_result),
                         },
                     )
                     .await

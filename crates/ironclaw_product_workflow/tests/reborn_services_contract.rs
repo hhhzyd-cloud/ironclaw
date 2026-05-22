@@ -25,7 +25,7 @@ use ironclaw_threads::{
     MessageStatus, RedactMessageRequest, ReplayAcceptedInboundMessageRequest, SessionThreadError,
     SessionThreadRecord, SessionThreadService, SummaryArtifact, ThreadHistory,
     ThreadHistoryRequest, ThreadMessageId, ThreadMessageRecord, ThreadScope,
-    UpdateAssistantDraftRequest,
+    UpdateAssistantDraftRequest, UpdateToolResultReferenceRequest,
 };
 use ironclaw_turns::{
     AcceptedMessageRef, AdmissionRejection, AdmissionRejectionReason, CancelRunRequest,
@@ -448,6 +448,13 @@ impl SessionThreadService for ScopeMismatchThreadStub {
         _request: AppendToolResultReferenceRequest,
     ) -> Result<ThreadMessageRecord, SessionThreadError> {
         panic!("ScopeMismatchThreadStub::append_tool_result_reference should not be reached")
+    }
+
+    async fn update_tool_result_reference(
+        &self,
+        _request: UpdateToolResultReferenceRequest,
+    ) -> Result<ThreadMessageRecord, SessionThreadError> {
+        panic!("ScopeMismatchThreadStub::update_tool_result_reference should not be reached")
     }
 
     async fn update_assistant_draft(

@@ -45,7 +45,8 @@ use ironclaw_host_runtime::{
 use ironclaw_loop_support::{
     CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
     HostIdentityContextBuildError, HostIdentityContextCandidate, HostIdentityContextSource,
-    HostManagedModelRequest, HostRuntimeLoopCapabilityPortFactory, LoopCapabilityResultWriter,
+    HostManagedModelRequest, HostRuntimeLoopCapabilityPortFactory, JsonSpawnSubagentInputCodec,
+    LoopCapabilityResultWriter,
 };
 use ironclaw_product_adapters::{
     ProductInboundAck, ProductInboundEnvelope, ProductInboundPayload, ProductTriggerReason,
@@ -55,6 +56,10 @@ use ironclaw_product_workflow::{
     ConversationBindingService, DefaultInboundTurnService, DefaultProductWorkflow,
     IdempotencyLedger, InboundTurnService, ProductConversationRouteKind, ResolveBindingRequest,
     ResolvedBinding,
+};
+use ironclaw_reborn::subagent::{
+    flavors::StaticSubagentFlavorPolicyResolver,
+    gate_resolution::BoundedSubagentGateResolutionStore, goal_store::BoundedSubagentGoalStore,
 };
 use ironclaw_reborn::{
     loop_driver_host::LoopCapabilityPortFactory,
@@ -117,6 +122,8 @@ type HarnessResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type HarnessCapabilityParts = (
     Arc<dyn LoopCapabilityPortFactory>,
     Arc<dyn CapabilitySurfaceProfileResolver>,
+    Arc<dyn ironclaw_loop_support::LoopCapabilityInputResolver>,
+    Arc<dyn LoopCapabilityResultWriter>,
     HarnessCapabilityRecorder,
 );
 
@@ -700,8 +707,13 @@ impl RebornBinaryE2EHarness {
         let loop_checkpoint_store: Arc<dyn LoopCheckpointStore> = turn_store.clone();
         let milestone_sink =
             Arc::new(ironclaw_turns::run_profile::InMemoryLoopHostMilestoneSink::default());
-        let (capability_factory, capability_surface_resolver, capability_recorder) =
-            capability_mode.into_parts(milestone_sink.clone())?;
+        let (
+            capability_factory,
+            capability_surface_resolver,
+            capability_input_resolver,
+            capability_result_writer,
+            capability_recorder,
+        ) = capability_mode.into_parts(milestone_sink.clone())?;
         let turn_state_for_evidence: Arc<dyn TurnStateStore> = turn_store.clone();
         let evidence = Arc::new(HarnessLoopExitEvidencePort {
             inner: ThreadCheckpointLoopExitEvidencePort::new_with_thread_scope(
@@ -723,6 +735,13 @@ impl RebornBinaryE2EHarness {
             milestone_sink: milestone_sink.clone(),
             capability_factory,
             capability_surface_resolver,
+            capability_result_writer,
+            subagent_goal_store: Arc::new(BoundedSubagentGoalStore::new()),
+            subagent_gate_store: Arc::new(BoundedSubagentGateResolutionStore::new()),
+            subagent_flavor_resolver: Arc::new(StaticSubagentFlavorPolicyResolver),
+            subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(
+                capability_input_resolver,
+            )),
             loop_exit_evidence: evidence,
             config: DefaultPlannedRuntimeConfig {
                 worker: TurnRunnerWorkerConfig {
@@ -1224,6 +1243,7 @@ impl HarnessCapabilityMode {
         match self {
             Self::Recording(port) => {
                 let port = Arc::new(port);
+                let capability_io = Arc::new(ProductLiveCapabilityIo::default());
                 Ok((
                     Arc::new(HarnessCapabilityPortFactory {
                         port: Arc::clone(&port),
@@ -1233,6 +1253,8 @@ impl HarnessCapabilityMode {
                             TEST_CAPABILITY_ID,
                         )?]),
                     }),
+                    capability_io.clone(),
+                    capability_io,
                     HarnessCapabilityRecorder::Recording(port),
                 ))
             }
@@ -1241,6 +1263,8 @@ impl HarnessCapabilityMode {
                 Arc::new(StaticCapabilitySurfaceProfileResolver {
                     allow_set: CapabilityAllowSet::allowlist(harness.capability_ids.clone()),
                 }),
+                harness.io.clone(),
+                harness.capability_result_writer(),
                 HarnessCapabilityRecorder::HostRuntime(harness),
             )),
         }
@@ -1381,6 +1405,13 @@ impl HostRuntimeCapabilityHarness {
         Arc::new(HostRuntimeHarnessCapabilityPortFactory {
             harness: Arc::clone(self),
             milestone_sink,
+        })
+    }
+
+    fn capability_result_writer(self: &Arc<Self>) -> Arc<dyn LoopCapabilityResultWriter> {
+        Arc::new(RecordingCapabilityResultWriter {
+            inner: self.io.clone(),
+            results: Arc::clone(&self.results),
         })
     }
 
@@ -1611,6 +1642,27 @@ impl LoopCapabilityResultWriter for RecordingCapabilityResultWriter {
             output,
         });
         Ok(result_ref)
+    }
+
+    async fn update_capability_result(
+        &self,
+        run_context: &LoopRunContext,
+        result_ref: &LoopResultRef,
+        output: serde_json::Value,
+    ) -> Result<(), AgentLoopHostError> {
+        self.inner
+            .update_capability_result(run_context, result_ref, output.clone())
+            .await?;
+        self.results.lock().unwrap().push(RecordedCapabilityResult {
+            capability_id: CapabilityId::new(
+                ironclaw_loop_support::DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID,
+            )
+            .map_err(|error| {
+                AgentLoopHostError::new(AgentLoopHostErrorKind::Internal, error.to_string())
+            })?,
+            output,
+        });
+        Ok(())
     }
 }
 

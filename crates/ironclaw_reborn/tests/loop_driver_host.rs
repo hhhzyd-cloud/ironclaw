@@ -31,9 +31,9 @@ use ironclaw_loop_support::{
     HostInputQueue, HostInputQueueError, HostManagedModelError, HostManagedModelErrorKind,
     HostManagedModelGateway, HostManagedModelRequest, HostManagedModelResponse,
     HostRuntimeLoopCapabilityPort, HostSkillContextBuildError, HostSkillContextCandidate,
-    HostSkillContextSource, IdentityApplicability, IdentityFileName, LoopCapabilityInputResolver,
-    LoopCapabilityResultWriter, ProductLiveCancellationProbe, RunCancellationFactory,
-    RunCancellationHandle, identity_message_ref,
+    HostSkillContextSource, IdentityApplicability, IdentityFileName, JsonSpawnSubagentInputCodec,
+    LoopCapabilityInputResolver, LoopCapabilityResultWriter, ProductLiveCancellationProbe,
+    RunCancellationFactory, RunCancellationHandle, identity_message_ref,
 };
 use ironclaw_processes::ProcessServices;
 use ironclaw_reborn::driver_registry::{
@@ -56,6 +56,10 @@ use ironclaw_reborn::planned_driver_factory::default_planned_run_profile_resolve
 use ironclaw_reborn::runtime::{
     DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts, build_default_planned_runtime,
     build_product_live_planned_runtime,
+};
+use ironclaw_reborn::subagent::{
+    flavors::StaticSubagentFlavorPolicyResolver,
+    gate_resolution::BoundedSubagentGateResolutionStore, goal_store::BoundedSubagentGoalStore,
 };
 use ironclaw_reborn::text_loop_driver::TextOnlyModelReplyDriver;
 use ironclaw_reborn::turn_runner::{
@@ -1873,7 +1877,7 @@ async fn planned_host_factory_create_host_uses_profiled_capabilities() {
     let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
         runtime: runtime.clone(),
         visible_request: host_runtime_visible_request(&fixture, ["demo"]),
-        io,
+        io: io.clone(),
         milestone_sink: fixture.milestone_sink.clone(),
     });
     let surface_resolver = Arc::new(StaticCapabilitySurfaceProfileResolver::new(
@@ -1990,7 +1994,7 @@ async fn planned_host_factory_sanitizes_capability_profile_resolver_errors() {
     let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
         runtime,
         visible_request: host_runtime_visible_request(&fixture, ["demo"]),
-        io,
+        io: io.clone(),
         milestone_sink: fixture.milestone_sink.clone(),
     });
     let surface_resolver = Arc::new(FailingCapabilitySurfaceProfileResolver::internal(
@@ -2087,7 +2091,7 @@ async fn default_planned_runtime_composes_no_profile_coordinator_and_profiled_ho
     let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
         runtime: runtime.clone(),
         visible_request: host_runtime_visible_request(&fixture, ["demo"]),
-        io,
+        io: io.clone(),
         milestone_sink: fixture.milestone_sink.clone(),
     });
     let surface_resolver = Arc::new(StaticCapabilitySurfaceProfileResolver::new(
@@ -2108,6 +2112,11 @@ async fn default_planned_runtime_composes_no_profile_coordinator_and_profiled_ho
         milestone_sink: fixture.milestone_sink.clone(),
         capability_factory,
         capability_surface_resolver: surface_resolver,
+        capability_result_writer: io.clone(),
+        subagent_goal_store: Arc::new(BoundedSubagentGoalStore::new()),
+        subagent_gate_store: Arc::new(BoundedSubagentGateResolutionStore::new()),
+        subagent_flavor_resolver: Arc::new(StaticSubagentFlavorPolicyResolver),
+        subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(io.clone())),
         loop_exit_evidence: evidence,
         config: DefaultPlannedRuntimeConfig {
             worker: TurnRunnerWorkerConfig {
@@ -2208,7 +2217,7 @@ async fn product_live_runtime_builds_when_all_required_adapters_are_present() {
     let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
         runtime,
         visible_request: host_runtime_visible_request(&fixture, ["demo"]),
-        io,
+        io: io.clone(),
         milestone_sink: fixture.milestone_sink.clone(),
     });
     let model_route_resolver: Arc<dyn ModelRouteResolver> = Arc::new(
@@ -2233,6 +2242,11 @@ async fn product_live_runtime_builds_when_all_required_adapters_are_present() {
         capability_surface_resolver: Arc::new(StaticCapabilitySurfaceProfileResolver::new(
             CapabilityAllowSet::allowlist([CapabilityId::new("demo.allowed").unwrap()]),
         )),
+        capability_result_writer: io.clone(),
+        subagent_goal_store: Arc::new(BoundedSubagentGoalStore::new()),
+        subagent_gate_store: Arc::new(BoundedSubagentGateResolutionStore::new()),
+        subagent_flavor_resolver: Arc::new(StaticSubagentFlavorPolicyResolver),
+        subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(io.clone())),
         loop_exit_evidence: Arc::new(ThreadCheckpointLoopExitEvidencePort::new(
             fixture.thread_service.clone(),
             turn_state_store_dyn(&turn_store),
@@ -2277,7 +2291,7 @@ async fn product_live_parts_for_gate_test(
     let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
         runtime,
         visible_request: host_runtime_visible_request(&fixture, ["demo"]),
-        io,
+        io: io.clone(),
         milestone_sink: fixture.milestone_sink.clone(),
     });
     let model_route_resolver: Arc<dyn ModelRouteResolver> = Arc::new(
@@ -2301,6 +2315,11 @@ async fn product_live_parts_for_gate_test(
         capability_surface_resolver: Arc::new(StaticCapabilitySurfaceProfileResolver::new(
             CapabilityAllowSet::allowlist([CapabilityId::new("demo.allowed").unwrap()]),
         )),
+        capability_result_writer: io.clone(),
+        subagent_goal_store: Arc::new(BoundedSubagentGoalStore::new()),
+        subagent_gate_store: Arc::new(BoundedSubagentGateResolutionStore::new()),
+        subagent_flavor_resolver: Arc::new(StaticSubagentFlavorPolicyResolver),
+        subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(io.clone())),
         loop_exit_evidence: Arc::new(ThreadCheckpointLoopExitEvidencePort::new(
             fixture.thread_service.clone(),
             turn_state_store_dyn(&turn_store),
@@ -2811,11 +2830,11 @@ async fn text_only_host_prompt_rejects_codeact_mode_and_zero_budget() {
 }
 
 #[tokio::test]
-async fn text_only_host_prompt_rejects_inline_messages() {
+async fn text_only_host_prompt_materializes_inline_messages() {
     let fixture = HostFixture::new("thread-host-prompt-inline", "hello reborn").await;
     let host = fixture.build_host().await;
 
-    let error = host
+    let prompt_bundle = host
         .build_prompt_bundle(LoopPromptBundleRequest {
             mode: PromptMode::TextOnly,
             context_cursor: None,
@@ -2829,15 +2848,16 @@ async fn text_only_host_prompt_rejects_inline_messages() {
             }],
         })
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert_eq!(error.kind, AgentLoopHostErrorKind::PolicyDenied);
-    assert_eq!(
-        error.safe_summary,
-        "inline_messages not yet supported by this prompt builder"
+    assert_eq!(prompt_bundle.messages[0].role, "user");
+    assert!(
+        prompt_bundle.messages[0]
+            .content_ref
+            .as_str()
+            .starts_with("msg:inline.user.")
     );
     assert!(fixture.gateway.requests().is_empty());
-    assert!(fixture.milestones().is_empty());
 }
 
 #[tokio::test]

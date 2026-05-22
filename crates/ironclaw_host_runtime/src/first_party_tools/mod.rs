@@ -45,6 +45,7 @@ pub use skill_management::{
 pub use time::TIME_CAPABILITY_ID;
 
 pub const BUILTIN_FIRST_PARTY_PROVIDER: &str = "builtin";
+pub(crate) const SPAWN_SUBAGENT_CAPABILITY_ID: &str = "builtin.spawn_subagent";
 
 const MAX_FIRST_PARTY_INPUT_BYTES: usize = 1_048_576;
 const MAX_WRITE_FILE_INPUT_BYTES: usize = 6 * 1024 * 1024;
@@ -80,6 +81,7 @@ pub fn builtin_first_party_package() -> Result<ExtensionPackage, ExtensionError>
                     json::manifest()?,
                     http::manifest()?,
                     shell::manifest()?,
+                    spawn_subagent_manifest()?,
                 ];
                 capabilities.extend(coding::manifests()?);
                 capabilities.extend(skill_management::manifests()?);
@@ -107,9 +109,23 @@ pub fn builtin_first_party_handlers() -> Result<FirstPartyCapabilityRegistry, Ho
         .with_handler(CapabilityId::new(LIST_DIR_CAPABILITY_ID)?, handler.clone())
         .with_handler(CapabilityId::new(GLOB_CAPABILITY_ID)?, handler.clone())
         .with_handler(CapabilityId::new(GREP_CAPABILITY_ID)?, handler.clone())
-        .with_handler(CapabilityId::new(APPLY_PATCH_CAPABILITY_ID)?, handler);
+        .with_handler(
+            CapabilityId::new(APPLY_PATCH_CAPABILITY_ID)?,
+            handler.clone(),
+        )
+        .with_handler(CapabilityId::new(SPAWN_SUBAGENT_CAPABILITY_ID)?, handler);
     skill_management::insert_handlers(&mut registry)?;
     Ok(registry)
+}
+
+fn spawn_subagent_manifest() -> Result<CapabilityManifest, ExtensionError> {
+    first_party_capability_manifest(
+        SPAWN_SUBAGENT_CAPABILITY_ID,
+        "Authorize a scoped child subagent run",
+        vec![EffectKind::DispatchCapability, EffectKind::SpawnProcess],
+        PermissionMode::Ask,
+        resource_profile(),
+    )
 }
 
 fn first_party_capability_manifest(
@@ -195,6 +211,9 @@ impl FirstPartyCapabilityHandler for BuiltinFirstPartyTools {
             | APPLY_PATCH_CAPABILITY_ID => {
                 coding::dispatch(&request, &self.coding_read_state, &self.coding_edit_locks).await?
             }
+            SPAWN_SUBAGENT_CAPABILITY_ID => serde_json::json!({
+                "authorized": true,
+            }),
             _ => {
                 return Err(FirstPartyCapabilityError::new(
                     RuntimeDispatchErrorKind::UndeclaredCapability,
