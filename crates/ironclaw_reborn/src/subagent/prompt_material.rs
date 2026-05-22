@@ -320,6 +320,7 @@ mod tests {
         let context = ironclaw_agent_loop::test_support::test_run_context("goal");
         store
             .put_goal(
+                &context.scope,
                 context.run_id,
                 SubagentGoal {
                     task: "research task".to_string(),
