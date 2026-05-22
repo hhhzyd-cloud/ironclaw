@@ -38,7 +38,9 @@ async fn postgres_substrate_builder_wires_production_components_without_local_on
         .await
         .unwrap();
 
-    let production_config = ProductionWiringConfig::new([]).require_runtime_http_egress();
+    let production_config = ProductionWiringConfig::new([])
+        .require_runtime_http_egress()
+        .require_credential_broker();
     services
         .validate_production_wiring(&production_config)
         .expect("postgres substrate production wiring should not use fake seams");
@@ -72,15 +74,15 @@ async fn postgres_substrate_builder_rejects_missing_secret_master_key() {
 
 fn production_runtime_policy() -> EffectiveRuntimePolicy {
     EffectiveRuntimePolicy {
-        deployment: DeploymentMode::LocalSingleUser,
-        requested_profile: RuntimeProfile::LocalDev,
-        resolved_profile: RuntimeProfile::LocalDev,
-        filesystem_backend: FilesystemBackendKind::HostWorkspace,
-        process_backend: ProcessBackendKind::LocalHost,
-        network_mode: NetworkMode::DirectLogged,
-        secret_mode: SecretMode::ScrubbedEnv,
+        deployment: DeploymentMode::HostedMultiTenant,
+        requested_profile: RuntimeProfile::HostedSafe,
+        resolved_profile: RuntimeProfile::HostedSafe,
+        filesystem_backend: FilesystemBackendKind::TenantWorkspace,
+        process_backend: ProcessBackendKind::TenantSandbox,
+        network_mode: NetworkMode::Brokered,
+        secret_mode: SecretMode::TenantBroker,
         approval_policy: ApprovalPolicy::AskDestructive,
-        audit_mode: AuditMode::LocalMinimal,
+        audit_mode: AuditMode::Standard,
     }
 }
 
