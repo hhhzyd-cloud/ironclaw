@@ -814,34 +814,48 @@ pub async fn build_reborn_runtime(
     let capability_factory = local_dev_capabilities.capability_factory;
     let model_gateway = local_dev_capabilities.model_gateway;
 
-    // Hook framework activation (#3934), gated behind the typed
-    // `HooksActivationConfig` carried in `RebornRuntimeInput` (default OFF).
-    // The env var (`HOOKS_ENABLED`) is resolved ONCE at the edge that builds
-    // the input (the CLI / ingress adapter); this composition root consumes the
-    // typed config and never reads the environment itself — testable without
-    // env mutation. When OFF this is `None` and `build_default_planned_runtime`
-    // composes no dispatcher — zero behavior change. When ON, the per-run
-    // dispatcher builder factory is built against this tenant's extension
-    // registry (per-tenant scoping by construction: this whole function runs
-    // once per identity). Fail-closed: a malformed manifest hook fails the
-    // build here rather than silently composing a broken dispatcher.
+    // Hook framework activation (#3934 + third-party projection), gated behind
+    // the typed `HooksActivationConfig` carried in `RebornRuntimeInput` (master
+    // flag default OFF; third-party sub-flag also default OFF). The env vars
+    // (`HOOKS_ENABLED`, `HOOKS_THIRD_PARTY_ENABLED`) are resolved ONCE at the
+    // edge that builds the input (the CLI / ingress adapter); this composition
+    // root consumes the typed config and never reads the environment itself.
+    // When the master flag is OFF this is `None` and `build_default_planned_runtime`
+    // composes no dispatcher — zero behavior change.
+    //
+    // Hook-only projection containment: third-party `[[hooks]]` are discovered
+    // and projected into a `HookProjectionRegistry` that reaches ONLY this hook
+    // factory — never `HostRuntimeServices::new` / the capability catalog /
+    // surface resolver. The newtype is the type-enforced boundary (no conversion
+    // back to `ExtensionRegistry`). Per-tenant scoping is by construction: this
+    // function runs once per authenticated identity, and the discovery root is
+    // DERIVED from `tenant_id`, never caller-supplied.
+    //
+    // FS-hardening gate: `HOOKS_THIRD_PARTY_ENABLED` MUST NOT be enabled in
+    // multi-tenant production until `openat2(RESOLVE_BENEATH)` / `O_NOFOLLOW`
+    // backend hardening lands. v1 ships the projection-layer strict-child /
+    // no-`..` / no-symlink-escape containment check plus the canonicalizing
+    // local backend. With the sub-flag OFF, this path is byte-identical to
+    // #3938 (builtin-only).
     let hook_dispatcher_builder_factory = {
-        // Activation scope today: this passes the *builtin* extension registry
-        // only, and the first-party builtin catalog is empty. So when the flag
-        // is ON, the live runtime activates exactly one hook source — `[[hooks]]`
-        // declared by builtin/host-bundled packages. Hooks declared by
-        // third-party *installed* extensions are NOT yet surfaced into this
-        // path (no installed-extension registry is threaded here). The loader
-        // (`install_extension_hooks`) fully supports installed-tier extension
-        // hooks; this call site simply doesn't feed it a third-party registry
-        // yet. Wiring the per-tenant installed-extension registry here is the
-        // follow-up that turns on live third-party activation.
-        let registry = builtin_extension_registry()?;
-        build_hook_dispatcher_builder_factory(hooks_config, &registry).map_err(|error| {
-            RebornRuntimeError::InvalidArgument {
+        let third_party_input = crate::hooks::ThirdPartyDiscoveryInput {
+            filesystem: local_runtime.extension_filesystem.as_ref(),
+            tenant_id: &validated_identity.tenant_id,
+        };
+        let projection_registry = crate::hooks::build_hook_projection_registry(
+            builtin_extension_registry()?,
+            Some(third_party_input),
+            hooks_config,
+        )
+        .await
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: format!("hook projection registry assembly failed: {error}"),
+        })?;
+        build_hook_dispatcher_builder_factory(hooks_config, &projection_registry).map_err(
+            |error| RebornRuntimeError::InvalidArgument {
                 reason: format!("hook framework activation failed: {error}"),
-            }
-        })?
+            },
+        )?
     };
 
     let composition = build_default_planned_runtime(DefaultPlannedRuntimeParts {

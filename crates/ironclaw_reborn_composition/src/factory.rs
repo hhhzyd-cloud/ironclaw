@@ -47,6 +47,11 @@ pub(crate) struct RebornLocalRuntimeServices {
     pub(crate) loop_checkpoint_store: Arc<InMemoryLoopCheckpointStore>,
     pub(crate) thread_service: Arc<InMemorySessionThreadService>,
     pub(crate) skill_filesystem: Arc<ScopedFilesystem<LocalFilesystem>>,
+    /// Tenant-scoped root filesystem used for third-party extension hook
+    /// discovery (`/system/extensions/<tenant>`). The runtime derives the
+    /// discovery root from the authenticated tenant id; this is the same
+    /// backend the rest of local-dev composition uses.
+    pub(crate) extension_filesystem: Arc<LocalFilesystem>,
 }
 
 impl std::fmt::Debug for RebornServices {
@@ -168,6 +173,7 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         loop_checkpoint_store: Arc::new(InMemoryLoopCheckpointStore::default()),
         thread_service: Arc::new(InMemorySessionThreadService::default()),
         skill_filesystem,
+        extension_filesystem: Arc::clone(&filesystem),
     });
 
     let mut services = HostRuntimeServices::new(
