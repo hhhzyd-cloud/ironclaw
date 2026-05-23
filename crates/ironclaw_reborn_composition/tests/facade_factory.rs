@@ -514,6 +514,22 @@ async fn production_rejects_memory_libsql_event_store() {
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
+#[ignore = "TODO(#3856): restore when tenant sandbox process-port wiring exists"]
+async fn production_libsql_services_wire_first_party_runtime_http_egress() {
+    // Restore the ProductionValidated readiness and host_runtime.health()
+    // happy-path assertions that are temporarily fail-closed below.
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+#[ignore = "TODO(#3856): restore when tenant sandbox process-port wiring exists"]
+async fn production_postgres_services_wire_first_party_runtime_http_egress() {
+    // Restore the ProductionValidated readiness and host_runtime.health()
+    // happy-path assertions that are temporarily fail-closed below.
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
 async fn production_libsql_services_require_process_port_for_first_party_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("reborn.db");
@@ -589,6 +605,22 @@ async fn production_postgres_services_require_process_port_for_first_party_runti
         ),
         "postgres first-party shell capability should keep production wiring fail-closed until a tenant sandbox process port is configured: {report:?}"
     );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+#[ignore = "TODO(#3856): restore when tenant sandbox process-port wiring exists"]
+async fn migration_dry_run_validates_libsql_shape() {
+    // Restore the MigrationDryRunValidated readiness and planned-profile
+    // submit_turn assertions that are temporarily fail-closed below.
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+#[ignore = "TODO(#3856): restore when tenant sandbox process-port wiring exists"]
+async fn migration_dry_run_validates_postgres_planned_turn_profile() {
+    // Restore the MigrationDryRunValidated readiness and planned-profile
+    // submit_turn assertions that are temporarily fail-closed below.
 }
 
 #[cfg(feature = "libsql")]

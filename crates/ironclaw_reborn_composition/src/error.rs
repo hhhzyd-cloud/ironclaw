@@ -6,6 +6,8 @@ pub enum RebornBuildError {
     InvalidConfig { reason: String },
     #[error("reborn composition requires database handle for {backend}")]
     MissingDatabaseHandle { backend: &'static str },
+    #[error("reborn production composition requires explicit secret master key")]
+    MissingSecretMasterKey,
     #[error("reborn composition requires configured production trust policy")]
     MissingProductionTrustPolicy,
     #[error("reborn composition requires resolved runtime policy")]
@@ -49,10 +51,7 @@ impl From<ironclaw_host_runtime::ProductionWiringReport> for RebornBuildError {
 impl From<crate::RebornCompositionError> for RebornBuildError {
     fn from(error: crate::RebornCompositionError) -> Self {
         match error {
-            crate::RebornCompositionError::MissingSecretMasterKey => Self::InvalidConfig {
-                reason: "reborn production composition requires explicit secret master key"
-                    .to_string(),
-            },
+            crate::RebornCompositionError::MissingSecretMasterKey => Self::MissingSecretMasterKey,
             crate::RebornCompositionError::Mount(error) => Self::Mount(error),
             crate::RebornCompositionError::Filesystem(error) => Self::Filesystem(error),
             crate::RebornCompositionError::Resource(error) => Self::Resource(error),
@@ -68,5 +67,17 @@ impl From<crate::RebornCompositionError> for RebornBuildError {
                 Self::ProductionWiring { report }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RebornBuildError;
+
+    #[test]
+    fn composition_missing_secret_master_key_stays_typed_for_facade_errors() {
+        let error = RebornBuildError::from(crate::RebornCompositionError::MissingSecretMasterKey);
+
+        assert!(matches!(error, RebornBuildError::MissingSecretMasterKey));
     }
 }
