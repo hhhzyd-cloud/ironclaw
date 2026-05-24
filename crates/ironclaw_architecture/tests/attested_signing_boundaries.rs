@@ -78,11 +78,20 @@ fn signing_provider_trait_crate_has_no_chain_crypto_or_secrets_dependency() {
     );
 }
 
-/// The dependency names the attestation crate (PR2) must never carry. It is the
-/// canonical / render / hash core and stays one layer above the chain crates:
-/// no chain SDK, no key custody, no webauthn (those land in PR4/PR6). `sha2`
-/// (its hashing primitive) and `serde` are allowed and so are deliberately
-/// absent from this list.
+/// The dependency names the attestation crate must never carry. It is the
+/// canonical / render / hash core plus (as of PR4) the WebAuthn registry +
+/// verifier and the durable challenge store. It stays one layer above the chain
+/// crates: no chain SDK and no key custody.
+///
+/// PR4 deliberately ADDS a WebAuthn crypto dependency (`webauthn-rs-core`) for
+/// COSE key handling + assertion signature verification, so `webauthn-rs*` is
+/// NOT forbidden here — verifying passkey assertions is this crate's job. What
+/// remains forbidden is chain SDKs (solana/near/alloy), the EVM crypto
+/// primitives that belong to the chain layer (`k256`/`sha3`), key custody
+/// (`ironclaw_secrets`), and the chain-signing crate (`ironclaw_chain_signing`)
+/// — the custodial keys and per-chain decode/sign/broadcast land in PR6, not
+/// here. `sha2` (hashing), `serde`, and `p256` (the test-only software
+/// authenticator) are allowed and deliberately absent from this list.
 const ATTESTATION_FORBIDDEN_DEPENDENCY_PREFIXES: &[&str] = &[
     "solana-sdk",
     "solana-program",
@@ -91,7 +100,6 @@ const ATTESTATION_FORBIDDEN_DEPENDENCY_PREFIXES: &[&str] = &[
     "alloy",
     "k256",
     "sha3",
-    "webauthn-rs",
     "ironclaw_secrets",
     "ironclaw_chain_signing",
 ];

@@ -16,9 +16,22 @@ dist = false
 async-trait = "0.1"
 ironclaw_signing_provider = { path = "../ironclaw_signing_provider" }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+# WebAuthn assertion crypto (COSE key handling + ECDSA/EdDSA verification). We
+# use the lower-level *-core crate for `COSEKey::verify_signature` and the COSE
+# key model, and drive the Relying-Party policy checks (UV, type, challenge
+# echo, rpIdHash, origin, signCount regression, BE/BS) ourselves in verify.rs —
+# we do NOT adopt webauthn-rs's session/state model so we can bind OUR
+# ChallengePreimage commitment as the expected challenge. MPL-2.0 (weak,
+# per-file copyleft; acceptable as an unmodified upstream dependency).
+webauthn-rs-core = "0.5"
 
 [dev-dependencies]
-serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+# Test-only software authenticator: mint P-256/ES256 assertions to drive the
+# verifier through valid + adversarial paths. Already in the lockfile via
+# webauthn-rs-core's transitive graph.
+p256 = { version = "0.13", features = ["ecdsa"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
