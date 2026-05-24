@@ -5835,11 +5835,13 @@ dependencies = [
  "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-postgres",
  "tokio-tungstenite 0.29.0",
  "tokio-util",
  "tower 0.5.3",
  "tower-http 0.6.10",
  "tracing",
+ "url",
  "uuid",
 ]
 

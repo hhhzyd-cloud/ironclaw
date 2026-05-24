@@ -184,12 +184,17 @@ async fn near_provider_registered_with_config_reaches_verification() {
     let account = "alice.near";
     let bindings = Arc::new(InMemoryAttestedGateBindingStore::new());
     let config = AttestedProvidersConfig {
-        near_redirect: Some(ironclaw_reborn_composition::NearRedirectConfig {
-            wallet_base_url: "https://wallet.testnet.near.org/sign".to_string(),
-            callback_url: "https://app.example/near/callback".to_string(),
-            state_secret: SecretString::from("test-state-secret-bytes".to_string()),
-        }),
-        walletconnect_project_id: None,
+        near_redirect: Some(
+            ironclaw_reborn_composition::NearRedirectConfig::new(
+                "https://wallet.testnet.near.org/sign",
+                "https://app.example/near/callback",
+                // >=32-byte, high-entropy secret (validated config rejects
+                // short / placeholder / low-entropy keys).
+                "f3K9pLm2QzR7vWx1Yb4Nc8Hd6Ts0Ug5Ej2Aq",
+            )
+            .expect("valid near config"),
+        ),
+        walletconnect: None,
     };
     let comp = composition(Arc::clone(&bindings), config);
     let err = register_and_continue(
@@ -232,7 +237,12 @@ async fn walletconnect_provider_registered_with_config_reaches_verification() {
     let bindings = Arc::new(InMemoryAttestedGateBindingStore::new());
     let config = AttestedProvidersConfig {
         near_redirect: None,
-        walletconnect_project_id: Some("00000000000000000000000000000000".to_string()),
+        walletconnect: Some(
+            ironclaw_reborn_composition::WalletConnectConfig::new(
+                "00000000000000000000000000000000",
+            )
+            .expect("valid wc project id"),
+        ),
     };
     // Sanity: the project id is a publishable id, constructs cleanly.
     let _ = WcProjectId::from("00000000000000000000000000000000");
@@ -255,13 +265,15 @@ async fn walletconnect_provider_registered_with_config_reaches_verification() {
 #[test]
 fn from_env_is_fail_closed_when_unset() {
     // The test process does not set the attested-signing env vars.
-    let config = AttestedProvidersConfig::from_env();
     // Guard: only assert fail-closed when the ambient env is genuinely unset
     // (avoids a flaky failure if a developer exported one locally).
-    if std::env::var("ATTESTED_NEAR_STATE_SECRET").is_err() {
+    let near_unset = std::env::var("ATTESTED_NEAR_WALLET_BASE_URL").is_err()
+        && std::env::var("ATTESTED_NEAR_CALLBACK_URL").is_err()
+        && std::env::var("ATTESTED_NEAR_STATE_SECRET").is_err();
+    let wc_unset = std::env::var("ATTESTED_WALLETCONNECT_PROJECT_ID").is_err();
+    if near_unset && wc_unset {
+        let config = AttestedProvidersConfig::from_env().expect("unset env resolves cleanly");
         assert!(config.near_redirect.is_none());
-    }
-    if std::env::var("ATTESTED_WALLETCONNECT_PROJECT_ID").is_err() {
-        assert!(config.walletconnect_project_id.is_none());
+        assert!(config.walletconnect.is_none());
     }
 }

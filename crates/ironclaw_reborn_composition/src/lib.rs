@@ -58,8 +58,9 @@ pub use attested::LibSqlAttestedComposition;
 pub use attested::PostgresAttestedComposition;
 pub use attested::{LocalDevAttestedComposition, NoopBroadcaster, RebornAttestedComposition};
 pub use attested_config::{
-    AttestedProvidersConfig, NEAR_CALLBACK_URL_ENV, NEAR_STATE_SECRET_ENV,
-    NEAR_WALLET_BASE_URL_ENV, NearRedirectConfig, WALLETCONNECT_PROJECT_ID_ENV,
+    AttestedConfigError, AttestedProvidersConfig, MIN_STATE_SECRET_BYTES, NEAR_CALLBACK_URL_ENV,
+    NEAR_STATE_SECRET_ENV, NEAR_WALLET_BASE_URL_ENV, NearRedirectConfig,
+    WALLETCONNECT_PROJECT_ID_ENV, WalletConnectConfig,
 };
 pub use attested_continuation::RebornAttestedContinuation;
 #[cfg(all(feature = "attested-broadcast", feature = "libsql"))]

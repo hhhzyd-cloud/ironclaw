@@ -41,9 +41,7 @@
 
 use std::sync::Arc;
 
-use ironclaw_attested_runtime::{
-    AttestedGateBindingStore, ContinuationError, CustodialMainnetShipGate,
-};
+use ironclaw_attested_runtime::{ContinuationError, CustodialMainnetShipGate};
 use ironclaw_attested_store::{ChainRpcEndpoints, MultiChainBroadcaster};
 use ironclaw_chain_signing::{SecretsKeyStore, ShipGate};
 
@@ -75,6 +73,87 @@ fn non_empty_env(key: &str) -> Option<String> {
     }
 }
 
+/// Validate the configured RPC endpoints (scheme/host) before they reach the
+/// broadcaster, which otherwise stores the URL string verbatim and only fails
+/// at first broadcast. A present endpoint must be a well-formed http(s) URL
+/// with a host, and must not target a loopback / link-local / cloud-metadata
+/// host (SSRF / credential-exfil hardening): an attacker-influenced "RPC URL"
+/// pointing at `169.254.169.254` or `localhost` could otherwise be used to
+/// probe internal services with the signed-payload POST.
+///
+/// `None` endpoints stay `None` (that chain family is simply unconfigured and
+/// fails closed at broadcast time).
+fn validated_endpoints(
+    endpoints: ChainRpcEndpoints,
+) -> Result<ChainRpcEndpoints, ContinuationError> {
+    Ok(ChainRpcEndpoints {
+        evm: validate_optional_rpc_url("evm", endpoints.evm)?,
+        solana: validate_optional_rpc_url("solana", endpoints.solana)?,
+        near: validate_optional_rpc_url("near", endpoints.near)?,
+    })
+}
+
+fn validate_optional_rpc_url(
+    family: &str,
+    raw: Option<String>,
+) -> Result<Option<String>, ContinuationError> {
+    match raw {
+        None => Ok(None),
+        Some(value) => {
+            let trimmed = value.trim();
+            let parsed = url::Url::parse(trimmed).map_err(|_| ContinuationError::Broadcast {
+                reason: format!("{family} RPC URL is not a valid URL"),
+            })?;
+            match parsed.scheme() {
+                "http" | "https" => {}
+                _ => {
+                    return Err(ContinuationError::Broadcast {
+                        reason: format!("{family} RPC URL must be http(s)"),
+                    });
+                }
+            }
+            let host = parsed
+                .host_str()
+                .filter(|host| !host.is_empty())
+                .ok_or_else(|| ContinuationError::Broadcast {
+                    reason: format!("{family} RPC URL must have a host"),
+                })?;
+            if is_internal_host(host) {
+                return Err(ContinuationError::Broadcast {
+                    reason: format!("{family} RPC URL targets a disallowed internal/metadata host"),
+                });
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+}
+
+/// Reject loopback, link-local, and cloud-metadata hosts. Uses conservative
+/// literal and IP-prefix matching (no DNS resolution — that would be a TOCTOU
+/// window and a network call at assembly time).
+fn is_internal_host(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    if host == "localhost"
+        || host.ends_with(".localhost")
+        || host == "metadata"
+        || host == "metadata.google.internal"
+    {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.octets() == [169, 254, 169, 254]
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        };
+    }
+    false
+}
+
 /// The custodial keystore + operator ship-gate the durable composition signs
 /// under. Built by the composition root from the production master key (the
 /// durable secret store / KMS); the ship-gate reads `CUSTODIAL_MAINNET_ENABLED`
@@ -101,19 +180,38 @@ impl DurableCustody {
 mod libsql_assembly {
     use super::*;
     use crate::attested::LibSqlAttestedComposition;
-    use ironclaw_attested_store::{LibSqlSealedGrantStore, LibSqlSigningLedger};
+    use ironclaw_attested_store::{
+        LibSqlAttestedGateBindingStore, LibSqlSealedGrantStore, LibSqlSigningLedger,
+    };
 
     /// Assemble the durable libSQL / Turso attested-signing composition over a
-    /// libSQL database handle. Runs the grant + ledger migrations, builds the
-    /// real per-chain broadcaster from `endpoints`, and registers the
-    /// external-wallet providers from `providers`.
+    /// libSQL database handle. Runs the grant + ledger + binding migrations,
+    /// builds the **durable** gate-binding store (so the authoritative
+    /// resume/driver binding survives a restart — it is not an in-memory store
+    /// while grant/ledger are durable), validates + builds the real per-chain
+    /// broadcaster from `endpoints`, and registers the external-wallet
+    /// providers from `providers`.
+    ///
+    /// The binding store is built here (typed) rather than accepted as an
+    /// `Arc<dyn AttestedGateBindingStore>`, which is what closes the
+    /// "durable assembly accepts an in-memory binding store" gap: a caller
+    /// cannot hand this path an `InMemoryAttestedGateBindingStore`.
     pub async fn assemble_libsql(
         db: Arc<libsql::Database>,
-        bindings: Arc<dyn AttestedGateBindingStore>,
         custody: DurableCustody,
         endpoints: ChainRpcEndpoints,
         providers: AttestedProvidersConfig,
     ) -> Result<LibSqlAttestedComposition, ContinuationError> {
+        // Durable, restart-surviving gate-binding store (runs its own migration
+        // + hydrates its sync-read cache in `connect`).
+        let bindings = Arc::new(
+            LibSqlAttestedGateBindingStore::connect(Arc::clone(&db))
+                .await
+                .map_err(|error| ContinuationError::Broadcast {
+                    reason: format!("libsql attested gate-binding store: {error}"),
+                })?,
+        );
+
         let grants = Arc::new(LibSqlSealedGrantStore::new(Arc::clone(&db)));
         grants
             .run_migrations()
@@ -129,13 +227,14 @@ mod libsql_assembly {
                 reason: format!("libsql signing ledger migration: {error}"),
             })?;
 
+        let endpoints = validated_endpoints(endpoints)?;
         let broadcaster = Arc::new(MultiChainBroadcaster::from_endpoints(endpoints)?);
         let registry = providers.build_provider_registry(
             Arc::clone(&grants) as Arc<dyn ironclaw_attestation::SealedGrantStore>
         );
 
         Ok(RebornAttestedComposition::assemble(
-            bindings,
+            bindings as Arc<dyn ironclaw_attested_runtime::AttestedGateBindingStore>,
             custody.keystore,
             custody.ship_gate,
             grants,
@@ -153,31 +252,60 @@ pub use libsql_assembly::assemble_libsql;
 mod postgres_assembly {
     use super::*;
     use crate::attested::PostgresAttestedComposition;
-    use ironclaw_attested_store::{PostgresSealedGrantStore, PostgresSigningLedger};
+    use ironclaw_attested_store::{
+        PostgresAttestedGateBindingStore, PostgresSealedGrantStore, PostgresSigningLedger,
+    };
 
     /// Assemble the durable PostgreSQL attested-signing composition over a
-    /// connection pool. Builds the real per-chain broadcaster from `endpoints`
-    /// and registers the external-wallet providers from `providers`.
+    /// connection pool.
     ///
-    /// Migrations for the PG stores are owned by the production schema-migration
-    /// path (alongside the other reborn PG tables), not run here.
-    pub fn assemble_postgres(
+    /// Runs the idempotent attested grant / ledger / binding PG migrations
+    /// (mirroring `assemble_libsql`) so the composition does not assemble OK and
+    /// then fail on the first seal / ledger advance / binding write. Builds the
+    /// **durable** gate-binding store (typed, not an arbitrary
+    /// `Arc<dyn AttestedGateBindingStore>`), so the authoritative
+    /// resume/driver binding cannot silently be in-memory while grant/ledger are
+    /// durable. Validates + builds the real per-chain broadcaster from
+    /// `endpoints` and registers the external-wallet providers from `providers`.
+    pub async fn assemble_postgres(
         pool: deadpool_postgres::Pool,
-        bindings: Arc<dyn AttestedGateBindingStore>,
         custody: DurableCustody,
         endpoints: ChainRpcEndpoints,
         providers: AttestedProvidersConfig,
     ) -> Result<PostgresAttestedComposition, ContinuationError> {
-        let grants = Arc::new(PostgresSealedGrantStore::new(pool.clone()));
-        let ledger = Arc::new(PostgresSigningLedger::new(pool));
+        // Durable, restart-surviving gate-binding store (runs its own migration
+        // + hydrates its sync-read cache in `connect`).
+        let bindings = Arc::new(
+            PostgresAttestedGateBindingStore::connect(pool.clone())
+                .await
+                .map_err(|error| ContinuationError::Broadcast {
+                    reason: format!("postgres attested gate-binding store: {error}"),
+                })?,
+        );
 
+        let grants = Arc::new(PostgresSealedGrantStore::new(pool.clone()));
+        grants
+            .run_migrations()
+            .await
+            .map_err(|error| ContinuationError::Broadcast {
+                reason: format!("postgres grant store migration: {error}"),
+            })?;
+        let ledger = Arc::new(PostgresSigningLedger::new(pool));
+        ledger
+            .run_migrations()
+            .await
+            .map_err(|error| ContinuationError::Broadcast {
+                reason: format!("postgres signing ledger migration: {error}"),
+            })?;
+
+        let endpoints = validated_endpoints(endpoints)?;
         let broadcaster = Arc::new(MultiChainBroadcaster::from_endpoints(endpoints)?);
         let registry = providers.build_provider_registry(
             Arc::clone(&grants) as Arc<dyn ironclaw_attestation::SealedGrantStore>
         );
 
         Ok(RebornAttestedComposition::assemble(
-            bindings,
+            bindings as Arc<dyn ironclaw_attested_runtime::AttestedGateBindingStore>,
             custody.keystore,
             custody.ship_gate,
             grants,

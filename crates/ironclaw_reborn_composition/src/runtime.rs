@@ -890,7 +890,7 @@ pub async fn build_reborn_runtime(
     // external-wallet provider registry starts empty here; PR11's gate/resolve
     // ingress registers the injected/NEAR/WalletConnect providers over the
     // shared grant store when it owns the per-provider ceremony secrets.
-    let attested_signing = build_attested_composition(attested_gate_bindings);
+    let attested_signing = build_attested_composition(attested_gate_bindings)?;
 
     Ok(RebornRuntime {
         services,
@@ -924,7 +924,7 @@ pub async fn build_reborn_runtime(
 /// key; durable persistence of grants/ledger/keystore is PR12.
 fn build_attested_composition(
     bindings: Arc<InMemoryAttestedGateBindingStore>,
-) -> LocalDevAttestedComposition {
+) -> Result<LocalDevAttestedComposition, RebornRuntimeError> {
     // Local-dev master key for the custodial keystore AAD. Production wires a
     // real master key (OS keychain / KMS); this dev key never signs mainnet
     // because the ship-gate refuses it without secure custody.
@@ -948,10 +948,18 @@ fn build_attested_composition(
     // ceremony config is present in the environment (fail-closed: absent config
     // leaves the provider unregistered, so its wire variant decodes, reaches the
     // driver, and fails closed as `ProviderMismatch` — see `attested_config`).
+    // Present-but-invalid config (placeholder/empty secret, malformed URL or
+    // project id) is a hard error here: fail closed at startup rather than
+    // register a weakened verifier.
     let providers = AttestedProvidersConfig::from_env()
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: format!("attested provider config: {error}"),
+        })?
         .build_provider_registry(Arc::clone(&grants) as Arc<dyn SealedGrantStore>);
 
-    LocalDevAttestedComposition::new_in_memory(bindings, keystore, ship_gate, grants, providers)
+    Ok(LocalDevAttestedComposition::new_in_memory(
+        bindings, keystore, ship_gate, grants, providers,
+    ))
 }
 
 const LOOP_RUN_CAPABILITY_ID: &str = "loop.run";
