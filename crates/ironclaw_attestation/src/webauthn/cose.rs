@@ -127,15 +127,13 @@ impl CosePublicKey {
         // missing alg is not by itself fatal, but a present-and-unsupported alg
         // is — fail-closed.)
         match key.alg {
-            Some(RegisteredLabelWithPrivate::Assigned(alg)) => {
-                if !matches!(alg, Algorithm::ES256 | Algorithm::EdDSA) {
-                    return Err(CoseError::UnsupportedAlgorithm);
-                }
-            }
-            // A non-assigned (text/private) algorithm label is unsupported.
+            // `alg` is OPTIONAL in COSE_Key (None) or one we support — proceed
+            // to derive the concrete algorithm from kty+crv below.
+            None
+            | Some(RegisteredLabelWithPrivate::Assigned(Algorithm::ES256 | Algorithm::EdDSA)) => {}
+            // A present-but-unsupported assigned alg, or any non-assigned
+            // (text/private) label, is fail-closed.
             Some(_) => return Err(CoseError::UnsupportedAlgorithm),
-            // alg is OPTIONAL in COSE_Key; derive from kty+crv below.
-            None => {}
         }
 
         match key.kty {
