@@ -5,22 +5,23 @@
 //! ([`verify`]) is what authorizes IronClaw to use a custody key for exactly
 //! one signing operation.
 //!
-//! ## Why `webauthn-rs-core` (and not a hand-rolled verifier)
+//! ## Crypto layering (openssl-free, pure Rust)
 //!
 //! WebAuthn assertion verification is security-critical and error-prone: COSE
 //! key decoding, ECDSA(P-256)/EdDSA signature checks over
 //! `authenticatorData ∥ SHA-256(clientDataJSON)`, and DER handling are exactly
 //! the places a hand-rolled implementation introduces silent vulnerabilities.
-//! We therefore delegate the *cryptographic* core to
-//! [`webauthn_rs_core`] (`COSEKey::verify_signature`, the COSE key model — a
-//! maintained, audited crate) while owning the *Relying-Party policy* checks
-//! ourselves in [`verify`]. We deliberately do NOT adopt webauthn-rs's
-//! `Webauthn`/session state model: that model imposes its own challenge
-//! lifecycle, whereas our anti-replay nonce is the
-//! [`crate::ChallengePreimage`] commitment from [`crate::challenge`]. Binding
-//! OUR challenge as the expected challenge requires running the RP checks
-//! ourselves. (`webauthn-rs-core` is MPL-2.0 — weak, per-file copyleft;
-//! acceptable as an unmodified upstream dependency.)
+//! This tree is a `ring`/`rustls` tree and does NOT accept the `openssl` native
+//! C dependency, so we do not use `webauthn-rs-core` (which pulls in
+//! `openssl`/`openssl-sys`). Instead [`cose`] confines the leaf crypto to three
+//! pure-Rust crates: [`coset`] (Apache-2.0) decodes the COSE_Key CBOR, `p256`
+//! (RustCrypto) verifies ES256, and `ed25519-dalek` verifies EdDSA. Only ES256
+//! and EdDSA are supported; any other algorithm is rejected fail-closed. We own
+//! all *Relying-Party policy* checks ourselves in [`verify`], and deliberately
+//! do NOT adopt any high-level WebAuthn session/state model: our anti-replay
+//! nonce is the [`crate::ChallengePreimage`] commitment from
+//! [`crate::challenge`], and binding OUR challenge as the expected challenge
+//! requires running the RP checks ourselves.
 //!
 //! ## Fail-closed posture
 //!
@@ -31,9 +32,11 @@
 //! produced. A `VerifiedAssertion` can only exist after the full checklist
 //! passed.
 
+pub(crate) mod cose;
 pub(crate) mod registry;
 pub(crate) mod verify;
 
+pub use cose::{CoseError, CosePublicKey};
 pub use registry::{
     Aaguid, AttestationPolicy, BackupFlagPolicy, BootstrapPolicy,
     InMemoryWebAuthnCredentialRegistry, OriginPolicy, RegisteredCredential, RegistrationError,

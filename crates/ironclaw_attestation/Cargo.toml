@@ -3,7 +3,7 @@ name = "ironclaw_attestation"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
-description = "Canonical signing-bytes + ApprovedTxHash core for the IronClaw attested-signing substrate (chain-SDK-free, no secrets/webauthn)"
+description = "Canonical signing-bytes + ApprovedTxHash core + WebAuthn registry/verifier for the IronClaw attested-signing substrate (chain-SDK-free, no secrets, openssl-free pure-Rust crypto)"
 authors = ["NEAR AI <support@near.ai>"]
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/nearai/ironclaw"
@@ -19,19 +19,23 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-# WebAuthn assertion crypto (COSE key handling + ECDSA/EdDSA verification). We
-# use the lower-level *-core crate for `COSEKey::verify_signature` and the COSE
-# key model, and drive the Relying-Party policy checks (UV, type, challenge
-# echo, rpIdHash, origin, signCount regression, BE/BS) ourselves in verify.rs —
-# we do NOT adopt webauthn-rs's session/state model so we can bind OUR
-# ChallengePreimage commitment as the expected challenge. MPL-2.0 (weak,
-# per-file copyleft; acceptable as an unmodified upstream dependency).
-webauthn-rs-core = "0.5"
+# WebAuthn assertion crypto — PURE RUST, openssl-free (this tree is a
+# ring/rustls tree and does NOT accept the openssl native C dep). We parse the
+# COSE_Key with `coset` (Google, pure-Rust, Apache-2.0) and verify the leaf
+# assertion signature ourselves with RustCrypto `p256` (ES256) and the vendored
+# `ed25519-dalek` (EdDSA). All Relying-Party policy checks (UV, type, challenge
+# echo, rpIdHash, origin, signCount regression, BE/BS, userHandle ownership)
+# live in verify.rs. authenticatorData is a fixed binary layout we parse by
+# hand, so no general CBOR decoder is pulled in beyond coset's own ciborium.
+coset = "0.4"
+ed25519-dalek = { version = "2.2.0", features = ["std"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
-# Test-only software authenticator: mint P-256/ES256 assertions to drive the
-# verifier through valid + adversarial paths. Already in the lockfile via
-# webauthn-rs-core's transitive graph.
-p256 = { version = "0.13", features = ["ecdsa"] }
+# Test-only software authenticator: mint ES256 (P-256) and EdDSA (Ed25519)
+# assertions to drive the verifier through valid + adversarial paths. The
+# `rand_core` feature on ed25519-dalek enables `SigningKey::generate` (test
+# keygen only); production verification needs no RNG.
+ed25519-dalek = { version = "2.2.0", features = ["std", "rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }

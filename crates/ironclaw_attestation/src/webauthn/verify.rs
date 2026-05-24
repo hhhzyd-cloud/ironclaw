@@ -1,10 +1,11 @@
 //! WebAuthn assertion verifier — the full Relying-Party (RP) validation.
 //!
 //! [`verify_assertion`] performs the complete RP checklist, fail-closed on any
-//! failure. The cryptographic signature check is delegated to
-//! `webauthn-rs-core` ([`COSEKey::verify_signature`]); every *policy* check is
-//! owned here so we can bind OUR [`crate::ChallengePreimage`] commitment as the
-//! expected challenge (see [`crate::webauthn`] module docs for why).
+//! failure. The leaf cryptographic signature check is delegated to the
+//! pure-Rust [`crate::webauthn::cose`] layer (`p256` for ES256, `ed25519-dalek`
+//! for EdDSA, `coset` for COSE_Key parsing — no openssl); every *policy* check
+//! is owned here so we can bind OUR [`crate::ChallengePreimage`] commitment as
+//! the expected challenge (see [`crate::webauthn`] module docs for why).
 //!
 //! ## RP validation checklist (all enforced, all fail-closed)
 //!
@@ -331,7 +332,7 @@ pub fn verify_assertion(
 
     let ok = credential
         .public_key
-        .verify_signature(input.signature, &verification_data)
+        .verify(input.signature, &verification_data)
         .map_err(|e| VerificationError::VerificationInternal {
             reason: e.to_string(),
         })?;
@@ -347,40 +348,46 @@ pub fn verify_assertion(
     })
 }
 
-/// Test-only software authenticator that mints ES256 (P-256) assertions, used
-/// to drive the verifier through valid + adversarial paths.
+/// Test-only software authenticator that mints ES256 (P-256) and EdDSA
+/// (Ed25519) assertions, used to drive the verifier through valid + adversarial
+/// paths.
 #[cfg(test)]
 pub(crate) mod test_authenticator {
     use super::*;
-    use p256::ecdsa::signature::Signer;
-    use p256::ecdsa::{Signature, SigningKey};
-    use webauthn_rs_core::proto::{COSEAlgorithm, COSEEC2Key, COSEKey, COSEKeyType, ECDSACurve};
+    use crate::webauthn::cose::CosePublicKey;
 
-    /// A software P-256 authenticator.
-    pub(crate) struct SoftwareAuthenticator {
-        signing_key: SigningKey,
+    /// A software authenticator over one of the supported algorithms.
+    pub(crate) enum SoftwareAuthenticator {
+        /// ES256 / P-256.
+        Es256(p256::ecdsa::SigningKey),
+        /// EdDSA / Ed25519.
+        Ed25519(Box<ed25519_dalek::SigningKey>),
     }
 
     impl SoftwareAuthenticator {
-        /// Generate a fresh P-256 authenticator.
+        /// Generate a fresh P-256 (ES256) authenticator.
         pub(crate) fn new_p256() -> Self {
-            let signing_key = SigningKey::random(&mut rand_core::OsRng);
-            Self { signing_key }
+            SoftwareAuthenticator::Es256(p256::ecdsa::SigningKey::random(&mut rand_core::OsRng))
         }
 
-        /// The COSE public key to register.
-        pub(crate) fn cose_key(&self) -> COSEKey {
-            let vk = self.signing_key.verifying_key();
-            let point = vk.to_encoded_point(false);
-            let x = point.x().expect("uncompressed point has x").to_vec();
-            let y = point.y().expect("uncompressed point has y").to_vec();
-            COSEKey {
-                type_: COSEAlgorithm::ES256,
-                key: COSEKeyType::EC_EC2(COSEEC2Key {
-                    curve: ECDSACurve::SECP256R1,
-                    x: x.into(),
-                    y: y.into(),
-                }),
+        /// Generate a fresh Ed25519 (EdDSA) authenticator.
+        pub(crate) fn new_ed25519() -> Self {
+            SoftwareAuthenticator::Ed25519(Box::new(ed25519_dalek::SigningKey::generate(
+                &mut rand_core::OsRng,
+            )))
+        }
+
+        /// The COSE public key to register (in our pure-Rust representation).
+        pub(crate) fn cose_key(&self) -> CosePublicKey {
+            match self {
+                SoftwareAuthenticator::Es256(sk) => {
+                    let vk = sk.verifying_key();
+                    let sec1 = vk.to_encoded_point(false).as_bytes().to_vec();
+                    CosePublicKey::Es256 { sec1 }
+                }
+                SoftwareAuthenticator::Ed25519(sk) => CosePublicKey::Ed25519 {
+                    public: sk.verifying_key().to_bytes(),
+                },
             }
         }
 
@@ -407,15 +414,25 @@ pub(crate) mod test_authenticator {
             .into_bytes()
         }
 
-        /// Sign `authenticatorData ∥ SHA-256(clientDataJSON)`, returning a DER
-        /// ECDSA signature (what an ES256 authenticator emits).
+        /// Sign `authenticatorData ∥ SHA-256(clientDataJSON)`. ES256 returns a
+        /// DER ECDSA signature; EdDSA returns the raw 64-byte signature — each
+        /// matching what a real authenticator of that type emits.
         pub(crate) fn sign(&self, authenticator_data: &[u8], client_data_json: &[u8]) -> Vec<u8> {
             let client_data_hash: [u8; 32] = Sha256::digest(client_data_json).into();
             let mut msg = Vec::new();
             msg.extend_from_slice(authenticator_data);
             msg.extend_from_slice(&client_data_hash);
-            let sig: Signature = self.signing_key.sign(&msg);
-            sig.to_der().as_bytes().to_vec()
+            match self {
+                SoftwareAuthenticator::Es256(sk) => {
+                    use p256::ecdsa::signature::Signer;
+                    let sig: p256::ecdsa::Signature = sk.sign(&msg);
+                    sig.to_der().as_bytes().to_vec()
+                }
+                SoftwareAuthenticator::Ed25519(sk) => {
+                    use ed25519_dalek::Signer;
+                    sk.sign(&msg).to_bytes().to_vec()
+                }
+            }
         }
     }
 
@@ -531,12 +548,23 @@ mod tests {
     }
 
     fn fixture(initial_sign_count: u32, backup_eligible: bool) -> Fixture {
+        fixture_with(
+            SoftwareAuthenticator::new_p256(),
+            initial_sign_count,
+            backup_eligible,
+        )
+    }
+
+    fn fixture_with(
+        auth: SoftwareAuthenticator,
+        initial_sign_count: u32,
+        backup_eligible: bool,
+    ) -> Fixture {
         let registry = InMemoryWebAuthnCredentialRegistry::new(
             Box::new(AllowAll),
             Box::new(AllowAll),
             Box::new(AllowAll),
         );
-        let auth = SoftwareAuthenticator::new_p256();
         registry
             .register(RegistrationRequest {
                 user: UserId::new("alice"),
@@ -608,6 +636,52 @@ mod tests {
         .expect("valid assertion must verify");
         assert_eq!(out.user, UserId::new("alice"));
         assert_eq!(out.new_sign_count, 1);
+    }
+
+    #[test]
+    fn valid_ed25519_assertion_with_uv_accepted() {
+        // Same full RP path, but the authenticator is EdDSA/Ed25519 — exercises
+        // the pure-Rust ed25519-dalek verification leaf.
+        let fx = fixture_with(SoftwareAuthenticator::new_ed25519(), 0, false);
+        let pre = preimage(1);
+        let commit = pre.commitment();
+        let out = run(
+            &fx,
+            &pre,
+            UP_UV,
+            1,
+            "webauthn.get",
+            ORIGIN,
+            &commit,
+            None,
+            false,
+        )
+        .expect("valid Ed25519 assertion must verify");
+        assert_eq!(out.user, UserId::new("alice"));
+        assert_eq!(out.new_sign_count, 1);
+    }
+
+    #[test]
+    fn bad_ed25519_signature_rejected() {
+        let fx = fixture_with(SoftwareAuthenticator::new_ed25519(), 0, false);
+        let pre = preimage(1);
+        let commit = pre.commitment();
+        let res = run(
+            &fx,
+            &pre,
+            UP_UV,
+            1,
+            "webauthn.get",
+            ORIGIN,
+            &commit,
+            None,
+            true,
+        );
+        assert!(matches!(
+            res,
+            Err(VerificationError::BadSignature)
+                | Err(VerificationError::VerificationInternal { .. })
+        ));
     }
 
     #[test]

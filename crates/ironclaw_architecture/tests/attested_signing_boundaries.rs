@@ -83,15 +83,16 @@ fn signing_provider_trait_crate_has_no_chain_crypto_or_secrets_dependency() {
 /// verifier and the durable challenge store. It stays one layer above the chain
 /// crates: no chain SDK and no key custody.
 ///
-/// PR4 deliberately ADDS a WebAuthn crypto dependency (`webauthn-rs-core`) for
-/// COSE key handling + assertion signature verification, so `webauthn-rs*` is
-/// NOT forbidden here — verifying passkey assertions is this crate's job. What
-/// remains forbidden is chain SDKs (solana/near/alloy), the EVM crypto
+/// PR4 verifies passkey assertions with PURE-RUST crypto (`coset` for COSE_Key,
+/// `p256` for ES256, `ed25519-dalek` for EdDSA). This tree is a `ring`/`rustls`
+/// tree and does NOT accept `openssl`, so `webauthn-rs` / `webauthn-rs-core`
+/// (which pull in `openssl`/`openssl-sys`) and `openssl*` itself are forbidden
+/// here. Also forbidden: chain SDKs (solana/near/alloy), the EVM crypto
 /// primitives that belong to the chain layer (`k256`/`sha3`), key custody
 /// (`ironclaw_secrets`), and the chain-signing crate (`ironclaw_chain_signing`)
 /// — the custodial keys and per-chain decode/sign/broadcast land in PR6, not
-/// here. `sha2` (hashing), `serde`, and `p256` (the test-only software
-/// authenticator) are allowed and deliberately absent from this list.
+/// here. `sha2`/`serde`, and the pure-Rust crypto crates (`coset`, `ciborium`,
+/// `p256`, `ed25519-dalek`) are allowed and deliberately absent from this list.
 const ATTESTATION_FORBIDDEN_DEPENDENCY_PREFIXES: &[&str] = &[
     "solana-sdk",
     "solana-program",
@@ -100,6 +101,8 @@ const ATTESTATION_FORBIDDEN_DEPENDENCY_PREFIXES: &[&str] = &[
     "alloy",
     "k256",
     "sha3",
+    "webauthn-rs",
+    "openssl",
     "ironclaw_secrets",
     "ironclaw_chain_signing",
 ];
@@ -138,10 +141,40 @@ fn attestation_crate_has_no_chain_secrets_or_webauthn_dependency() {
 
     assert!(
         violations.is_empty(),
-        "ironclaw_attestation is the canonical/render/hash core (PR2) and must carry no chain \
-         SDK, secrets, or webauthn dependency — those belong in PR4/PR6. Forbidden dependencies \
-         found:\n{}\nSee docs/plans/2026-05-23-attested-signing-substrate.md.",
+        "ironclaw_attestation is the canonical/render/hash + WebAuthn verifier core and must carry \
+         no chain SDK, secrets, chain-signing, openssl, or webauthn-rs dependency — chain custody \
+         lands in PR6 and openssl is banned tree-wide (pure-Rust crypto only). Forbidden \
+         dependencies found:\n{}\nSee docs/plans/2026-05-23-attested-signing-substrate.md.",
         violations.join("\n")
+    );
+}
+
+/// The whole tree is deliberately openssl-free (a `ring`/`rustls` tree). PR4's
+/// WebAuthn verifier uses pure-Rust crypto (`coset`/`p256`/`ed25519-dalek`)
+/// precisely so it adds NO `openssl`/`openssl-sys` native C dependency. This
+/// test asserts the resolved dependency graph carries neither — catching a
+/// regression anywhere in the workspace that would re-introduce openssl
+/// (e.g. swapping the WebAuthn crypto back to `webauthn-rs-core`).
+#[test]
+fn workspace_graph_is_openssl_free() {
+    let metadata = cargo_metadata_with_deps();
+    let packages = metadata["packages"]
+        .as_array()
+        .expect("cargo metadata must include packages");
+
+    let offenders: Vec<String> = packages
+        .iter()
+        .filter_map(|p| p["name"].as_str())
+        .filter(|name| *name == "openssl" || *name == "openssl-sys")
+        .map(|name| name.to_string())
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "the workspace dependency graph must be openssl-free (this is a ring/rustls tree). \
+         Found: {}. The attested-signing WebAuthn verifier must keep using pure-Rust crypto \
+         (coset/p256/ed25519-dalek) and must not pull in webauthn-rs-core (which links openssl).",
+        offenders.join(", ")
     );
 }
 
@@ -155,6 +188,24 @@ fn cargo_metadata() -> Value {
             "--no-deps",
             "--manifest-path",
         ])
+        .arg(&manifest_path)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run cargo metadata: {error}"));
+
+    assert!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("cargo metadata output must be JSON")
+}
+
+/// Full resolved dependency graph (no `--no-deps`), used to assert the absence
+/// of a transitive dependency such as `openssl`.
+fn cargo_metadata_with_deps() -> Value {
+    let manifest_path = workspace_root().join("Cargo.toml");
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--manifest-path"])
         .arg(&manifest_path)
         .output()
         .unwrap_or_else(|error| panic!("failed to run cargo metadata: {error}"));

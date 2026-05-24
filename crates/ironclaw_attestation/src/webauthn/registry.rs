@@ -33,11 +33,11 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use thiserror::Error;
-use webauthn_rs_core::proto::COSEKey;
 
 use ironclaw_signing_provider::UserId;
 
 use crate::challenge::CredentialId;
+use crate::webauthn::cose::CosePublicKey;
 
 /// AAGUID — the 16-byte authenticator model identifier.
 pub type Aaguid = [u8; 16];
@@ -51,7 +51,7 @@ pub struct RegisteredCredential {
     /// Credential id (the `id` echoed in `allowCredentials` / the assertion).
     pub credential_id: CredentialId,
     /// COSE public key used to verify assertion signatures.
-    pub public_key: COSEKey,
+    pub public_key: CosePublicKey,
     /// Authenticator model identifier.
     pub aaguid: Aaguid,
     /// Current signature counter. Monotonic non-decreasing across assertions;
@@ -72,7 +72,7 @@ pub struct RegistrationRequest {
     /// Credential id.
     pub credential_id: CredentialId,
     /// COSE public key.
-    pub public_key: COSEKey,
+    pub public_key: CosePublicKey,
     /// Authenticator model identifier.
     pub aaguid: Aaguid,
     /// Initial signature counter.

@@ -67,9 +67,9 @@ pub use grant::{
 pub use ledger::{InMemorySigningLedger, LedgerError, SigningLedger, SigningLedgerState};
 pub use rendered::{RenderedField, RenderedTx, render};
 pub use webauthn::{
-    Aaguid, AssertionInput, AttestationPolicy, BackupFlagPolicy, BootstrapPolicy,
-    InMemoryWebAuthnCredentialRegistry, OriginPolicy, RegisteredCredential, RegistrationError,
-    RegistrationRequest, SignCountPolicy, VerificationError, VerifiedAssertion,
+    Aaguid, AssertionInput, AttestationPolicy, BackupFlagPolicy, BootstrapPolicy, CoseError,
+    CosePublicKey, InMemoryWebAuthnCredentialRegistry, OriginPolicy, RegisteredCredential,
+    RegistrationError, RegistrationRequest, SignCountPolicy, VerificationError, VerifiedAssertion,
     WebAuthnCredentialRegistry, verify_assertion,
 };
 
