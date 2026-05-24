@@ -37,10 +37,11 @@ sha2 = "0.10"
 
 # Solana / NEAR ed25519 signing primitive — already vendored in-tree, so the
 # heavy solana-sdk / near-primitives SDKs are NOT pulled (see crate docs and
-# the PR body: SDK-level wire decode for Solana/NEAR is the immediate next
-# slice).
+# the PR body: SDK-level wire encode/decode for Solana/NEAR is the immediate
+# next slice). Signing operates over PR2's shared canonical signing bytes
+# (review finding #4), so no chain-specific wire serializer (and no borsh) is
+# needed in this slice.
 ed25519-dalek = "2"
-borsh = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 serde_json = "1"

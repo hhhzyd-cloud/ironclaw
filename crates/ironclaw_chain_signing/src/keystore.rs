@@ -26,6 +26,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use ironclaw_host_api::ResourceScope;
 use ironclaw_secrets::{SecretsCrypto, chain_key_aad};
+use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -49,6 +50,12 @@ pub struct ChainKeyBinding {
     pub evm_chain_id: Option<u64>,
     /// BIP-32 / SLIP-0010 derivation path the key was derived at (display only).
     pub derivation_path: String,
+    /// Opaque KMS/HSM key reference, when this key is custodied by a sign-only
+    /// backend ([`crate::kms::KmsSigner`]) rather than held as a hot key. `Some`
+    /// is REQUIRED for mainnet signing (the ship-gate routes mainnet through the
+    /// KMS path); `None` means hot-key custody, which the ship-gate permits for
+    /// testnet/dev only. Never key material — just a handle.
+    pub kms_key_ref: Option<String>,
 }
 
 /// A decrypted custodial private key, held only transiently.
@@ -244,7 +251,12 @@ impl KeyStore for SecretsKeyStore {
         // is UTF-8-only). Private key bytes are arbitrary binary, so we hex-encode
         // before encrypting and decode after decrypting — the AES-GCM tag still
         // covers the (hex) plaintext and the chain AAD unchanged.
-        let hex_key = hex_encode(&private_key);
+        //
+        // Both the caller-owned `private_key` Vec and the transient hex `String`
+        // hold raw key material; wrap them in `Zeroizing` so they are wiped from
+        // memory as soon as encryption consumes them (review finding #6).
+        let private_key = Zeroizing::new(private_key);
+        let hex_key = Zeroizing::new(hex_encode(&private_key));
         let (encrypted, salt) =
             self.crypto
                 .encrypt(hex_key.as_bytes(), &aad)
@@ -384,6 +396,7 @@ mod tests {
             public_address_hex: addr.to_string(),
             evm_chain_id: chain.strip_prefix("eip155:").and_then(|s| s.parse().ok()),
             derivation_path: "m/44'/60'/0'/0/0".to_string(),
+            kms_key_ref: None,
         }
     }
 

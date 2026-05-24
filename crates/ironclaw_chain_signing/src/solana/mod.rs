@@ -14,9 +14,13 @@ pub mod broadcast;
 pub mod decode;
 pub mod policy;
 pub mod render;
-pub mod sign;
+pub(crate) mod sign;
 
 pub use broadcast::{SolanaBroadcastOutcome, SolanaBroadcaster};
 pub use policy::{SolanaTokenMetadata, check_cluster, check_token_metadata};
 pub use render::render_solana;
-pub use sign::{SolanaSignature, message_bytes, public_key_of, sign_message_with_binding_check};
+// Only the signature *result* type is public. Raw key parsing and the signing
+// primitives in [`sign`] are `pub(crate)`: they are reachable only through the
+// guarded `CustodialSigner` flow (review finding #5), never as a standalone
+// "sign these bytes with this key" API.
+pub use sign::SolanaSignature;

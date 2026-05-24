@@ -5091,7 +5091,6 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-signer",
  "async-trait",
- "borsh",
  "ed25519-dalek",
  "hex",
  "ironclaw_attestation",

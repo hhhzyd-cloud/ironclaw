@@ -1,16 +1,22 @@
-//! Solana ed25519 signing over the serialized message, with a fee-payer
+//! Solana ed25519 signing over the canonical signing bytes, with a fee-payer
 //! pubkey binding check.
 //!
-//! ## Message serialization scope
+//! ## What is signed (review finding #4)
 //!
-//! The exact Solana on-wire message format (the bincode layout produced by
-//! `solana-sdk`'s `Message::serialize`) is intentionally NOT reproduced here —
-//! that requires the heavy `solana-sdk` crate, deferred to the next slice. We
-//! instead sign a deterministic, length-prefixed serialization of the
-//! PR2-projected message ([`message_bytes`]). The ed25519 signing primitive and
-//! the signer↔fee-payer binding check (the security-critical parts) are fully
-//! exercised; swapping in the real wire serializer is a localized change to
-//! [`message_bytes`].
+//! Rather than re-deriving a SEPARATE synthetic projection of the message here
+//! (which could drift from the bytes the approved hash was computed over), the
+//! custodial signer hands this function the EXACT
+//! [`ironclaw_attestation::canonical_signing_bytes`] of the decoded
+//! transaction — the single source of truth the [`ironclaw_signing_provider::ApprovedTxHash`]
+//! binds. The bytes signed are therefore byte-identical to the approved bytes by
+//! construction.
+//!
+//! The current canonical encoding is a deterministic, domain-separated field
+//! projection (PR2), not the `solana-sdk` `Message::serialize` wire layout —
+//! producing the on-wire bytes (so the signature is directly broadcastable)
+//! requires the heavy `solana-sdk` crate and is the deferred next slice, flagged
+//! in the crate docs / PR body. The equality-with-the-approved-hash property and
+//! the ed25519 + fee-payer-binding security checks are fully exercised here.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
@@ -28,7 +34,10 @@ pub struct SolanaSignature {
 }
 
 /// Parse a 32-byte ed25519 secret seed into a signing key.
-pub fn signing_key_from_bytes(bytes: &[u8]) -> Result<SigningKey, ChainSigningError> {
+///
+/// `pub(crate)`: raw key consumption stays inside the guarded custodial flow
+/// (review finding #5).
+pub(crate) fn signing_key_from_bytes(bytes: &[u8]) -> Result<SigningKey, ChainSigningError> {
     let arr: [u8; 32] = bytes.try_into().map_err(|_| ChainSigningError::Sign {
         chain: "solana",
         reason: "ed25519 secret key must be 32 bytes".to_string(),
@@ -36,82 +45,74 @@ pub fn signing_key_from_bytes(bytes: &[u8]) -> Result<SigningKey, ChainSigningEr
     Ok(SigningKey::from_bytes(&arr))
 }
 
-/// The 32-byte public key for a signing key.
-pub fn public_key_of(key: &SigningKey) -> [u8; 32] {
+/// The 32-byte public key for a signing key. `pub(crate)`: keystore-binding and
+/// tests only.
+pub(crate) fn public_key_of(key: &SigningKey) -> [u8; 32] {
     key.verifying_key().to_bytes()
 }
 
-/// Deterministic, length-prefixed serialization of the projected message.
-///
-/// NOTE: this is NOT the Solana wire format (see module docs) — it is a stable
-/// commitment over the same fields, sufficient for the signing primitive and
-/// binding tests. Replace with `solana-sdk` `Message::serialize` in the next
-/// slice.
-pub fn message_bytes(tx: &SolanaTransaction) -> Vec<u8> {
-    let mut out = Vec::new();
-    let push_lp = |out: &mut Vec<u8>, b: &[u8]| {
-        out.extend_from_slice(&(b.len() as u32).to_be_bytes());
-        out.extend_from_slice(b);
-    };
-    push_lp(&mut out, tx.cluster.as_bytes());
-    push_lp(&mut out, &tx.recent_blockhash.0);
-    out.extend_from_slice(&(tx.account_keys.len() as u32).to_be_bytes());
-    for k in &tx.account_keys {
-        out.extend_from_slice(&k.0);
-    }
-    out.extend_from_slice(&(tx.instructions.len() as u32).to_be_bytes());
-    for ix in &tx.instructions {
-        out.extend_from_slice(&ix.program_id.0);
-        out.extend_from_slice(&(ix.accounts.len() as u32).to_be_bytes());
-        for a in &ix.accounts {
-            out.extend_from_slice(&a.0);
-        }
-        push_lp(&mut out, &ix.data);
-    }
-    out.extend_from_slice(&tx.compute_unit_limit.unwrap_or(0).to_be_bytes());
-    out.extend_from_slice(&tx.compute_unit_price.unwrap_or(0).to_be_bytes());
-    out
-}
-
-/// Sign the message and enforce that the signer pubkey equals the message's
-/// first account key (the fee payer / required signer).
-///
-/// Mismatch fails closed: a key that is not the declared fee payer cannot
-/// produce a usable signature for this message.
-pub fn sign_message_with_binding_check(
-    tx: &SolanaTransaction,
-    key: &SigningKey,
-) -> Result<SolanaSignature, ChainSigningError> {
-    let fee_payer = tx
+/// The fee payer (first required signer) pubkey for a Solana message.
+pub(crate) fn fee_payer_of(tx: &SolanaTransaction) -> Result<[u8; 32], ChainSigningError> {
+    Ok(tx
         .account_keys
         .first()
         .ok_or(ChainSigningError::Sign {
             chain: "solana",
             reason: "message has no fee payer account key".to_string(),
         })?
-        .0;
+        .0)
+}
 
+/// Sign the 32-byte `digest` (the sha256 commitment of the canonical signing
+/// bytes, review finding #4) with a hot ed25519 key and enforce that the signer
+/// pubkey equals `fee_payer` (the message's first/required-signer account key).
+///
+/// Mismatch fails closed: a key that is not the declared fee payer cannot
+/// produce a usable signature.
+pub(crate) fn sign_canonical_hot(
+    digest: &[u8; 32],
+    fee_payer: [u8; 32],
+    key: &SigningKey,
+) -> Result<SolanaSignature, ChainSigningError> {
     let pubkey = public_key_of(key);
     if pubkey != fee_payer {
         return Err(ChainSigningError::SignerMismatch);
     }
+    let sig: Signature = key.sign(digest);
+    verify_and_wrap(digest, sig.to_bytes(), pubkey)
+}
 
-    let msg = message_bytes(tx);
-    let sig: Signature = key.sign(&msg);
+/// Bind a KMS-produced ed25519 signature: verify it against the fee-payer
+/// pubkey and `digest`, failing closed on any mismatch. No private-key bytes
+/// were in process.
+pub(crate) fn bind_kms_signature(
+    digest: &[u8; 32],
+    raw: &[u8],
+    fee_payer: [u8; 32],
+) -> Result<SolanaSignature, ChainSigningError> {
+    let sig: [u8; 64] = raw.try_into().map_err(|_| ChainSigningError::Sign {
+        chain: "solana",
+        reason: "ed25519 signature must be 64 bytes".to_string(),
+    })?;
+    verify_and_wrap(digest, sig, fee_payer)
+}
 
-    // Independently verify the signature against the recovered pubkey.
+/// Verify an ed25519 signature against `pubkey` and `msg`, returning the wrapped
+/// signature on success.
+fn verify_and_wrap(
+    msg: &[u8],
+    sig_bytes: [u8; 64],
+    pubkey: [u8; 32],
+) -> Result<SolanaSignature, ChainSigningError> {
     let vk = VerifyingKey::from_bytes(&pubkey).map_err(|e| ChainSigningError::Sign {
         chain: "solana",
         reason: format!("invalid verifying key: {e}"),
     })?;
-    vk.verify_strict(&msg, &sig)
-        .map_err(|e| ChainSigningError::Sign {
-            chain: "solana",
-            reason: format!("signature self-verification failed: {e}"),
-        })?;
-
+    let sig = Signature::from_bytes(&sig_bytes);
+    vk.verify_strict(msg, &sig)
+        .map_err(|_| ChainSigningError::SignerMismatch)?;
     Ok(SolanaSignature {
-        signature: sig.to_bytes(),
+        signature: sig_bytes,
         public_key: pubkey,
     })
 }
@@ -119,7 +120,9 @@ pub fn sign_message_with_binding_check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironclaw_attestation::{Bytes32, SolanaInstruction};
+    use ironclaw_attestation::{
+        Bytes32, RenderingSchemaVersion, SolanaInstruction, canonical_signing_bytes,
+    };
 
     fn key() -> SigningKey {
         SigningKey::from_bytes(&[0x22u8; 32])
@@ -141,17 +144,29 @@ mod tests {
         }
     }
 
+    fn digest(t: &SolanaTransaction) -> [u8; 32] {
+        let canonical = canonical_signing_bytes(
+            &ironclaw_attestation::DecodedTransaction::Solana(t.clone()),
+            RenderingSchemaVersion::CURRENT,
+        );
+        crate::sha256(&canonical)
+    }
+
     #[test]
     fn signs_when_key_is_fee_payer() {
         let k = key();
-        let sig = sign_message_with_binding_check(&tx(public_key_of(&k)), &k).expect("sign");
+        let t = tx(public_key_of(&k));
+        let fp = fee_payer_of(&t).unwrap();
+        let sig = sign_canonical_hot(&digest(&t), fp, &k).expect("sign");
         assert_eq!(sig.public_key, public_key_of(&k));
     }
 
     #[test]
     fn rejects_when_key_is_not_fee_payer() {
         let k = key();
-        let err = sign_message_with_binding_check(&tx([0xff; 32]), &k).unwrap_err();
+        let t = tx([0xff; 32]);
+        let fp = fee_payer_of(&t).unwrap();
+        let err = sign_canonical_hot(&digest(&t), fp, &k).unwrap_err();
         assert!(matches!(err, ChainSigningError::SignerMismatch));
     }
 }

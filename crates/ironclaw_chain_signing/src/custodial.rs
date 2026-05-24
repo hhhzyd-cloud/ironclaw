@@ -33,8 +33,8 @@ use ironclaw_signing_provider::{ApprovedTxHash, SigningContext};
 
 use crate::chain::{ChainFamily, ChainKeyId};
 use crate::error::ChainSigningError;
-use crate::keystore::{ConsumedChainKey, KeyStore};
-use crate::kms::ShipGate;
+use crate::keystore::{ChainKeyBinding, ConsumedChainKey, KeyStore};
+use crate::kms::{KmsSigner, ShipGate, SignatureAlg, SigningPath};
 use crate::policy::{CustodyDecision, KeyCustodyPolicy};
 
 /// Inputs to a custodial signing operation. Every value is already persisted /
@@ -69,13 +69,22 @@ pub struct CustodialSignOutcome {
     pub signer: String,
 }
 
+/// The signing path + the public binding decided by authorization.
+struct Authorized {
+    path: SigningPath,
+    binding: ChainKeyBinding,
+}
+
 /// The custodial signer, wired with a keystore, grant store, ledger, ship-gate,
-/// and an injectable custody policy.
+/// an optional sign-only KMS backend, and an injectable custody policy.
 pub struct CustodialSigner<K, G, L> {
     keystore: Arc<K>,
     grants: Arc<G>,
     ledger: Arc<L>,
     ship_gate: ShipGate,
+    /// Sign-only KMS/HSM backend. REQUIRED for mainnet signing (no private-key
+    /// bytes in process); absent means only testnet/dev hot-key signing works.
+    kms: Option<Arc<dyn KmsSigner>>,
     custody_policy: Arc<dyn KeyCustodyPolicy>,
 }
 
@@ -85,7 +94,8 @@ where
     G: SealedGrantStore,
     L: SigningLedger,
 {
-    /// Construct a custodial signer.
+    /// Construct a hot-key-only custodial signer (testnet/dev). Mainnet signing
+    /// will be refused by the ship-gate because no KMS backend is wired.
     pub fn new(
         keystore: Arc<K>,
         grants: Arc<G>,
@@ -98,21 +108,45 @@ where
             grants,
             ledger,
             ship_gate,
+            kms: None,
             custody_policy,
         }
     }
 
-    /// Run the two enforcement points and consume the chain key, returning the
-    /// decrypted key ONLY if both pass. Splitting this out keeps the
-    /// "no key access on failure" property obvious: every early return here
-    /// happens before the keystore `consume`.
-    async fn authorize_and_consume_key(
+    /// Construct a custodial signer wired with a sign-only KMS backend, enabling
+    /// the mainnet KMS signing path (no private-key bytes in process).
+    pub fn with_kms(
+        keystore: Arc<K>,
+        grants: Arc<G>,
+        ledger: Arc<L>,
+        ship_gate: ShipGate,
+        kms: Arc<dyn KmsSigner>,
+        custody_policy: Arc<dyn KeyCustodyPolicy>,
+    ) -> Self {
+        Self {
+            keystore,
+            grants,
+            ledger,
+            ship_gate,
+            kms: Some(kms),
+            custody_policy,
+        }
+    }
+
+    /// Run authorization: ship-gate (deciding hot-key vs KMS path), custody
+    /// policy, EXACT chain binding, the one-shot grant claim, and the sign-time
+    /// hash re-check — all BEFORE any key access. Returns the chosen signing
+    /// path and the public keystore binding.
+    ///
+    /// Every early return here happens before any private-key consumption or
+    /// KMS sign call, preserving the "no key access on failure" property.
+    async fn authorize(
         &self,
         req: &CustodialSignRequest,
         requested_family: ChainFamily,
-    ) -> Result<ConsumedChainKey, ChainSigningError> {
-        // --- Ship-gate (threat #18): refuse mainnet hot-key custodial. ---
-        self.ship_gate.authorize_chain(req.chain.as_str())?;
+    ) -> Result<Authorized, ChainSigningError> {
+        // --- Ship-gate (threat #18): mainnet => KMS path; testnet => hot key. ---
+        let path = self.ship_gate.authorize_chain(req.chain.as_str())?;
 
         // --- Injectable custody policy (deny-first defaults). ---
         if let CustodyDecision::Deny { reason } =
@@ -121,13 +155,38 @@ where
             return Err(ChainSigningError::PolicyDenied { reason });
         }
 
-        // --- Wrong-chain confusion (typed half): the decoded tx variant must
-        //     match the bound chain family before anything else. ---
+        // --- EXACT chain binding (review finding #2): family alone is not
+        //     enough (an eip155:1 key must not sign an eip155:10 tx). Require
+        //     full equality among the context chain id, the bound key chain,
+        //     the decoded tx's chain/network, and the typed family. ---
         let tx_family = ChainFamily::of_transaction(&req.decoded);
-        if tx_family != requested_family || requested_family != req.chain.family() {
+        let bound_chain = req.chain.as_str();
+        let tx_network = req.decoded.chain_network(); // e.g. "eip155:1"
+        if tx_family != requested_family
+            || requested_family != req.chain.family()
+            || bound_chain != req.context.chain_id.as_str()
+            || bound_chain != tx_network
+        {
             return Err(ChainSigningError::ChainMismatch {
                 bound: req.chain.to_string(),
-                requested: req.decoded.chain_tag().to_string(),
+                requested: tx_network,
+            });
+        }
+
+        // --- Read the public binding (no key access) and require its chain to
+        //     match exactly too, so a key row mis-filed under the wrong chain
+        //     cannot be used. ---
+        let binding = self
+            .keystore
+            .binding(&req.scope, &req.chain)
+            .await
+            .map_err(|e| ChainSigningError::KeyStore {
+                reason: e.to_string(),
+            })?;
+        if binding.chain.as_str() != bound_chain {
+            return Err(ChainSigningError::ChainMismatch {
+                bound: binding.chain.to_string(),
+                requested: bound_chain.to_string(),
             });
         }
 
@@ -141,15 +200,22 @@ where
         // --- Enforcement point #2: sign-time approved-tx-hash re-check. ---
         // Recompute the binding hash FROM THE PERSISTED decoded tx and compare
         // to the approved hash. Any post-approval mutation of `decoded` diverges
-        // the hash and fails closed BEFORE the key is consumed.
+        // the hash and fails closed BEFORE any key access.
         let recomputed = recompute_approved_hash(&req.decoded, req.schema_version);
         if recomputed != req.approved_tx_hash {
             return Err(ChainSigningError::ApprovedHashMismatch);
         }
 
-        // --- Both enforcement points passed: consume the chain key. ---
-        // The keystore re-checks the chain family and decrypts under the chain
-        // AAD (crypto wrong-chain defense).
+        Ok(Authorized { path, binding })
+    }
+
+    /// Consume the hot key (decrypt) for the request's chain. Only used on the
+    /// hot-key (testnet) path.
+    async fn consume_hot_key(
+        &self,
+        req: &CustodialSignRequest,
+        requested_family: ChainFamily,
+    ) -> Result<ConsumedChainKey, ChainSigningError> {
         self.keystore
             .consume(&req.scope, &req.chain, requested_family)
             .await
@@ -160,33 +226,55 @@ where
 
     /// Drive the full custodial signing flow for an EVM transaction.
     ///
-    /// The flow: authorize (both enforcement points) -> consume key -> advance
-    /// ledger `Approved -> Signing` -> sign with ecrecover binding check ->
-    /// advance `Signing -> Signed`. Broadcast is performed by the caller via
-    /// [`Self::mark_broadcast_submitted`] / [`Self::finalize`] so the ledger
-    /// transition and the network submit stay paired.
-    pub async fn sign_evm<T>(
+    /// The signable transaction is RECONSTRUCTED from `req.decoded` (the same
+    /// decoded tx the approved hash was computed over), so there is no separate
+    /// caller-supplied transaction that could drift from the approved one
+    /// (review finding #1). Flow: authorize (all enforcement points, before any
+    /// key access) -> advance ledger `Approved -> Signing` -> sign the rebuilt
+    /// digest via the gated path (hot key for testnet, KMS for mainnet) with the
+    /// ecrecover binding check -> advance `Signing -> Signed`.
+    pub async fn sign_evm(
         &self,
         req: &CustodialSignRequest,
-        tx: &T,
-    ) -> Result<CustodialSignOutcome, ChainSigningError>
-    where
-        T: alloy_consensus::SignableTransaction<alloy_primitives::Signature>,
-    {
-        let consumed = self
-            .authorize_and_consume_key(req, ChainFamily::Evm)
-            .await?;
+    ) -> Result<CustodialSignOutcome, ChainSigningError> {
+        let authorized = self.authorize(req, ChainFamily::Evm).await?;
+
+        // Reconstruct the signable tx FROM the decoded projection and compute
+        // the signing digest. This is byte-identical to the wallet/HSM digest
+        // (see decode::rebuild_signable tests) and derives from the exact
+        // decoded tx the approved hash was computed over.
+        let DecodedTransaction::Evm(evm) = &req.decoded else {
+            return Err(ChainSigningError::ChainMismatch {
+                bound: req.chain.to_string(),
+                requested: req.decoded.chain_tag().to_string(),
+            });
+        };
+        let rebuilt = crate::evm::decode::rebuild_signable(evm)?;
+        let digest = rebuilt.signature_hash();
+        let bound = bound_evm_address(&authorized.binding)?;
 
         // Advance the ledger into Signing only after authorization succeeds, so
-        // a rejected request never moves the ledger.
+        // a rejected request never moves the ledger. This happens BEFORE any key
+        // consumption so a stale ledger row fails before private-key access.
         self.ledger
             .advance(&req.context.gate_ref, SigningLedgerState::Signing)
             .await?;
 
-        let key = crate::evm::signing_key_from_bytes(consumed.expose_private_key())?;
-        let bound = bound_evm_address(&consumed)?;
-        let signed = crate::evm::sign_with_binding_check(tx, &key, bound)?;
-        // `consumed` (and the decrypted key) drops here.
+        let signed = match authorized.path {
+            SigningPath::HotKey => {
+                let consumed = self.consume_hot_key(req, ChainFamily::Evm).await?;
+                let key = crate::evm::sign::signing_key_from_bytes(consumed.expose_private_key())?;
+                // `consumed` (and the decrypted key) drops at the end of this arm.
+                crate::evm::sign::sign_prehash_hot(digest, &key, bound)?
+            }
+            SigningPath::Kms => {
+                let key_ref = self.require_kms_ref(&authorized)?;
+                let raw =
+                    self.require_kms()?
+                        .sign_digest(key_ref, &digest.0, SignatureAlg::Secp256k1)?;
+                crate::evm::sign::bind_kms_signature(digest, &raw, bound)?
+            }
+        };
 
         self.ledger
             .advance(&req.context.gate_ref, SigningLedgerState::Signed)
@@ -196,6 +284,133 @@ where
             signature: signed.signature.as_bytes().to_vec(),
             signer: format!("0x{}", hex_lower(signed.recovered.as_slice())),
         })
+    }
+
+    /// Drive the full custodial signing flow for a Solana transaction.
+    ///
+    /// Like [`Self::sign_evm`], the bytes signed are the SHARED
+    /// [`canonical_signing_bytes`] of `req.decoded` — the exact bytes the
+    /// approved hash binds (review finding #4) — so the signed bytes cannot
+    /// drift from the approved ones. Enforces all the same gates (ship-gate
+    /// path, custody policy, exact chain binding, one-shot grant, sign-time
+    /// hash re-check) before any key access (review finding #5).
+    pub async fn sign_solana(
+        &self,
+        req: &CustodialSignRequest,
+    ) -> Result<CustodialSignOutcome, ChainSigningError> {
+        let authorized = self.authorize(req, ChainFamily::Solana).await?;
+
+        let DecodedTransaction::Solana(sol) = &req.decoded else {
+            return Err(ChainSigningError::ChainMismatch {
+                bound: req.chain.to_string(),
+                requested: req.decoded.chain_tag().to_string(),
+            });
+        };
+        // The ed25519 signing digest is sha256 over the SHARED canonical bytes
+        // (review finding #4): both the hot-key and the digest-oriented KMS path
+        // sign the exact same 32 bytes, derived solely from `req.decoded`.
+        let signing_bytes = canonical_signing_bytes(&req.decoded, req.schema_version);
+        let digest = crate::sha256(&signing_bytes);
+        let fee_payer = crate::solana::sign::fee_payer_of(sol)?;
+
+        self.ledger
+            .advance(&req.context.gate_ref, SigningLedgerState::Signing)
+            .await?;
+
+        let signed = match authorized.path {
+            SigningPath::HotKey => {
+                let consumed = self.consume_hot_key(req, ChainFamily::Solana).await?;
+                let key =
+                    crate::solana::sign::signing_key_from_bytes(consumed.expose_private_key())?;
+                crate::solana::sign::sign_canonical_hot(&digest, fee_payer, &key)?
+            }
+            SigningPath::Kms => {
+                let key_ref = self.require_kms_ref(&authorized)?;
+                let raw =
+                    self.require_kms()?
+                        .sign_digest(key_ref, &digest, SignatureAlg::Ed25519)?;
+                crate::solana::sign::bind_kms_signature(&digest, &raw, fee_payer)?
+            }
+        };
+
+        self.ledger
+            .advance(&req.context.gate_ref, SigningLedgerState::Signed)
+            .await?;
+
+        Ok(CustodialSignOutcome {
+            signature: signed.signature.to_vec(),
+            signer: hex_lower(&signed.public_key),
+        })
+    }
+
+    /// Drive the full custodial signing flow for a NEAR transaction. See
+    /// [`Self::sign_solana`] for the shared properties.
+    pub async fn sign_near(
+        &self,
+        req: &CustodialSignRequest,
+    ) -> Result<CustodialSignOutcome, ChainSigningError> {
+        let authorized = self.authorize(req, ChainFamily::Near).await?;
+
+        if !matches!(&req.decoded, DecodedTransaction::Near(_)) {
+            return Err(ChainSigningError::ChainMismatch {
+                bound: req.chain.to_string(),
+                requested: req.decoded.chain_tag().to_string(),
+            });
+        }
+        let signing_bytes = canonical_signing_bytes(&req.decoded, req.schema_version);
+        let digest = crate::sha256(&signing_bytes);
+        let expected_pubkey = ed25519_pubkey_from_binding(&authorized.binding)?;
+
+        self.ledger
+            .advance(&req.context.gate_ref, SigningLedgerState::Signing)
+            .await?;
+
+        let signed = match authorized.path {
+            SigningPath::HotKey => {
+                let consumed = self.consume_hot_key(req, ChainFamily::Near).await?;
+                let key = crate::near::sign::signing_key_from_bytes(consumed.expose_private_key())?;
+                crate::near::sign::sign_canonical_hot(&digest, &key, expected_pubkey)?
+            }
+            SigningPath::Kms => {
+                let key_ref = self.require_kms_ref(&authorized)?;
+                let raw =
+                    self.require_kms()?
+                        .sign_digest(key_ref, &digest, SignatureAlg::Ed25519)?;
+                crate::near::sign::bind_kms_signature(&digest, &raw, expected_pubkey)?
+            }
+        };
+
+        self.ledger
+            .advance(&req.context.gate_ref, SigningLedgerState::Signed)
+            .await?;
+
+        Ok(CustodialSignOutcome {
+            signature: signed.signature.to_vec(),
+            signer: hex_lower(&signed.public_key),
+        })
+    }
+
+    /// Borrow the wired KMS backend or fail closed.
+    fn require_kms(&self) -> Result<&Arc<dyn KmsSigner>, ChainSigningError> {
+        self.kms
+            .as_ref()
+            .ok_or_else(|| ChainSigningError::ShipGateRefused {
+                reason: "mainnet KMS path required but no KMS backend wired".to_string(),
+            })
+    }
+
+    /// Borrow the binding's KMS key reference or fail closed.
+    fn require_kms_ref<'a>(
+        &self,
+        authorized: &'a Authorized,
+    ) -> Result<&'a str, ChainSigningError> {
+        authorized
+            .binding
+            .kms_key_ref
+            .as_deref()
+            .ok_or_else(|| ChainSigningError::KeyStore {
+                reason: "mainnet signing requires a KMS key_ref binding".to_string(),
+            })
     }
 
     /// Advance the ledger to `BroadcastSubmitted`. Call this immediately after
@@ -252,18 +467,39 @@ pub fn recompute_approved_hash(
     )
 }
 
-/// Parse the bound EVM address (hex, no `0x`) from a consumed key's binding.
+/// Parse the bound EVM address (hex, no `0x`) from a key binding.
 fn bound_evm_address(
-    consumed: &ConsumedChainKey,
+    binding: &ChainKeyBinding,
 ) -> Result<alloy_primitives::Address, ChainSigningError> {
-    let hex = consumed
-        .binding()
-        .public_address_hex
-        .trim_start_matches("0x");
+    let hex = binding.public_address_hex.trim_start_matches("0x");
     let bytes = hex_decode_20(hex).ok_or_else(|| ChainSigningError::KeyStore {
         reason: "bound EVM address is not 20 hex bytes".to_string(),
     })?;
     Ok(alloy_primitives::Address::from(bytes))
+}
+
+/// Parse the bound ed25519 public key (32-byte hex, no `0x`) from a binding.
+/// Used as the NEAR signer-key binding (and as the Solana fee-payer cross-check
+/// is the message's own first account key, not the binding).
+fn ed25519_pubkey_from_binding(binding: &ChainKeyBinding) -> Result<[u8; 32], ChainSigningError> {
+    let hex = binding.public_address_hex.trim_start_matches("0x");
+    hex_decode_32(hex).ok_or_else(|| ChainSigningError::KeyStore {
+        reason: "bound ed25519 public key is not 32 hex bytes".to_string(),
+    })
+}
+
+fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    let bytes = s.as_bytes();
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = nibble(bytes[i * 2])?;
+        let lo = nibble(bytes[i * 2 + 1])?;
+        *slot = (hi << 4) | lo;
+    }
+    Some(out)
 }
 
 fn hex_decode_20(s: &str) -> Option<[u8; 20]> {

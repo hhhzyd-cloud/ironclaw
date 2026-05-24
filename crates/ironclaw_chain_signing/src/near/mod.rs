@@ -2,20 +2,22 @@
 //!
 //! ## Scope note
 //!
-//! The signing primitive (ed25519 over `sha256(borsh(tx))`) uses the vendored
-//! `ed25519-dalek` + `borsh`, so this PR does NOT pull `near-primitives` /
-//! `near-crypto`. The borsh layout here ([`sign::NearSignableTx`]) mirrors the
-//! NEAR `Transaction` field order for the fields the PR2 projection carries; a
-//! full `near-primitives::Transaction` round-trip (covering every action arg
-//! shape) is the immediate next slice flagged in the PR body.
+//! The signing primitive (ed25519) uses the vendored `ed25519-dalek`, so this
+//! PR does NOT pull `near-primitives` / `near-crypto`. Signing operates on the
+//! shared [`ironclaw_attestation::canonical_signing_bytes`] (review finding #4);
+//! a full `near-primitives::Transaction` borsh round-trip producing a
+//! directly-broadcastable signature is the immediate next slice flagged in the
+//! PR body.
 
 pub mod broadcast;
 pub mod decode;
 pub mod policy;
 pub mod render;
-pub mod sign;
+pub(crate) mod sign;
 
 pub use broadcast::{NearBroadcastOutcome, NearBroadcaster};
 pub use policy::check_network;
 pub use render::render_near;
-pub use sign::{NearSignature, public_key_of, sign_transaction_with_binding_check};
+// Only the signature *result* type is public; the signing primitives in
+// [`sign`] are `pub(crate)` (review finding #5).
+pub use sign::NearSignature;

@@ -9,6 +9,7 @@ use aes_gcm::{
     aead::{Aead, AeadCore, OsRng, Payload},
 };
 use hkdf::Hkdf;
+use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
 use sha2::Sha256;
 
@@ -77,7 +78,7 @@ impl SecretsCrypto {
     pub fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, Vec<u8>), SecretError> {
         let salt = Self::generate_salt();
         let derived_key = self.derive_key(&salt)?;
-        let cipher = Aes256Gcm::new_from_slice(&derived_key)
+        let cipher = Aes256Gcm::new_from_slice(derived_key.as_slice())
             .map_err(|error| SecretError::EncryptionFailed(error.to_string()))?;
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let ciphertext = cipher
@@ -111,7 +112,7 @@ impl SecretsCrypto {
             ));
         }
         let derived_key = self.derive_key(salt)?;
-        let cipher = Aes256Gcm::new_from_slice(&derived_key)
+        let cipher = Aes256Gcm::new_from_slice(derived_key.as_slice())
             .map_err(|error| SecretError::DecryptionFailed(error.to_string()))?;
         let (nonce_bytes, ciphertext) = encrypted_value.split_at(NONCE_SIZE);
         let nonce = Nonce::from_slice(nonce_bytes);
@@ -127,10 +128,13 @@ impl SecretsCrypto {
         DecryptedSecret::from_bytes(plaintext)
     }
 
-    fn derive_key(&self, salt: &[u8]) -> Result<[u8; KEY_SIZE], SecretError> {
+    /// Derive the per-secret AES key via HKDF, returned in a [`Zeroizing`]
+    /// wrapper so the derived key material is wiped from the stack as soon as
+    /// the cipher has consumed it (rather than lingering in freed memory).
+    fn derive_key(&self, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_SIZE]>, SecretError> {
         let hk = Hkdf::<Sha256>::new(Some(salt), self.master_key.expose_secret().as_bytes());
-        let mut derived = [0u8; KEY_SIZE];
-        hk.expand(b"near-agent-secrets-v1", &mut derived)
+        let mut derived = Zeroizing::new([0u8; KEY_SIZE]);
+        hk.expand(b"near-agent-secrets-v1", derived.as_mut())
             .map_err(|_| SecretError::EncryptionFailed("HKDF expansion failed".to_string()))?;
         Ok(derived)
     }
