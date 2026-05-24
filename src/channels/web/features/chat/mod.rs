@@ -333,7 +333,8 @@ pub(crate) async fn chat_gate_resolve_handler(
     let mission_outcome = match req.resolution {
         GateResolutionPayload::Approved { .. }
         | GateResolutionPayload::CredentialProvided { .. }
-        | GateResolutionPayload::InjectedWalletProof { .. } => {
+        | GateResolutionPayload::InjectedWalletProof { .. }
+        | GateResolutionPayload::NearRedirectProof { .. } => {
             Some(ironclaw_engine::GateResolutionOutcome::Approved)
         }
         GateResolutionPayload::Denied => Some(ironclaw_engine::GateResolutionOutcome::Denied),
@@ -410,6 +411,30 @@ pub(crate) async fn chat_gate_resolve_handler(
                     signature,
                     approved_tx_hash,
                     public_key,
+                },
+            )
+            .await
+        }
+        GateResolutionPayload::NearRedirectProof {
+            account_id,
+            public_key,
+            signature,
+            approved_tx_hash,
+            access_key_scope,
+            state: near_state,
+        } => {
+            attested::resolve_near_redirect_proof(
+                &state,
+                &user.user_id,
+                gate_request_id,
+                req.thread_id.clone(),
+                attested::NearRedirectProofInput {
+                    account_id,
+                    public_key,
+                    signature,
+                    approved_tx_hash,
+                    access_key_scope,
+                    state: near_state,
                 },
             )
             .await
@@ -3210,6 +3235,106 @@ mod tests {
                     "signer": "0x00000000000000000000000000000000000000aa",
                     "signature": "00".repeat(65),
                     "approved_tx_hash": "07".repeat(16),
+                })
+                .to_string(),
+            ))
+            .expect("request");
+        req.extensions_mut().insert(UserIdentity {
+            user_id: "member-1".to_string(),
+            role: "member".to_string(),
+            workspace_read_scopes: Vec::new(),
+        });
+
+        let resp = ServiceExt::<axum::http::Request<Body>>::oneshot(app, req)
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_chat_gate_resolve_near_redirect_proof_fails_closed_without_composition() {
+        // PR8: the NEAR redirect proof arm routes through the same gate/resolve
+        // handler. Without the PR10 composition (sealed-grant store + persisted
+        // attested binding + state secret), it must fail closed with 503 — never
+        // panic, never silently accept, and never forward a submission.
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let state = test_gateway_state(None);
+        *state.msg_tx.write().await = Some(tx);
+        assert!(
+            state.attested_grant_store.is_none(),
+            "PR8 default state has no attested grant store"
+        );
+
+        let app = Router::new()
+            .route("/api/chat/gate/resolve", post(chat_gate_resolve_handler))
+            .with_state(state);
+
+        let request_id = Uuid::new_v4();
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/chat/gate/resolve")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "request_id": request_id,
+                    "thread_id": "gateway-thread-near",
+                    "resolution": "near_redirect_proof",
+                    "account_id": "alice.near",
+                    "public_key": "11".repeat(32),
+                    "signature": "00".repeat(64),
+                    "approved_tx_hash": "07".repeat(32),
+                    "access_key_scope": { "kind": "full_access" },
+                    "state": "deadbeef",
+                })
+                .to_string(),
+            ))
+            .expect("request");
+        req.extensions_mut().insert(UserIdentity {
+            user_id: "member-1".to_string(),
+            role: "member".to_string(),
+            workspace_read_scopes: Vec::new(),
+        });
+
+        let resp = ServiceExt::<axum::http::Request<Body>>::oneshot(app, req)
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            rx.try_recv().is_err(),
+            "fail-closed gate resolution must not forward a submission"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_gate_resolve_near_redirect_proof_malformed_hash_is_bad_request() {
+        // A malformed proof (short approved_tx_hash) must reject at the wire
+        // boundary with 400 regardless of composition state.
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let state = test_gateway_state(None);
+        let app = Router::new()
+            .route("/api/chat/gate/resolve", post(chat_gate_resolve_handler))
+            .with_state(state);
+
+        let request_id = Uuid::new_v4();
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/chat/gate/resolve")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "request_id": request_id,
+                    "resolution": "near_redirect_proof",
+                    "account_id": "alice.near",
+                    "public_key": "11".repeat(32),
+                    "signature": "00".repeat(64),
+                    "approved_tx_hash": "07".repeat(16),
+                    "access_key_scope": { "kind": "full_access" },
+                    "state": "deadbeef",
                 })
                 .to_string(),
             ))

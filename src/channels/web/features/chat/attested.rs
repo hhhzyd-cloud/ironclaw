@@ -39,8 +39,12 @@ use ironclaw_signing_provider::{
     ApprovedTxHash, SigningContext, SigningProof, SigningProvider, SigningProviderError,
 };
 use ironclaw_wallet_external::{
-    InjectedProofPayload, InjectedScheme, InjectedSigningProvider, encode_injected_proof,
+    InjectedProofPayload, InjectedScheme, InjectedSigningProvider, NearAccessKeyScope,
+    NearRedirectProofPayload, NearRedirectSigningProvider, encode_injected_proof,
+    encode_near_redirect_proof,
 };
+
+use crate::channels::web::types::NearAccessKeyScopeInput;
 
 use crate::channels::web::platform::state::GatewayState;
 use crate::channels::web::types::ActionResponse;
@@ -171,6 +175,151 @@ pub(crate) async fn resolve_injected_wallet_proof(
     // &_proof)`, and on success build `ResumeTurnRequest { attestation:
     // Some(..) }` + dispatch the broadcast through the existing gate-resolve
     // engine submission path. Not built in PR7.
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Attested external-wallet signing resume is not yet wired (pending PR10).".to_string(),
+    ))
+}
+
+/// The browser-supplied NEAR redirect proof fields, as carried on the
+/// `/api/chat/gate/resolve` wire payload (attested-signing PR8).
+#[derive(Debug, Clone)]
+pub(crate) struct NearRedirectProofInput {
+    /// Claimed NEAR account id (e.g. `alice.near`). Never trusted; bound against
+    /// the gate's bound account.
+    pub account_id: String,
+    /// Hex of the 32-byte ed25519 access-key public key.
+    pub public_key: String,
+    /// Hex signature bytes over the bound hash.
+    pub signature: String,
+    /// Hex of the approved-tx hash the wallet attested to.
+    pub approved_tx_hash: String,
+    /// The declared access-key scope.
+    pub access_key_scope: NearAccessKeyScopeInput,
+    /// The `state` parameter echoed back from the redirect.
+    pub state: String,
+}
+
+/// Parse the NEAR redirect wire input into the structured
+/// [`SigningProof::NearRedirectProof`].
+///
+/// Fails closed (`BAD_REQUEST`) on any malformed field. Pure deserialization —
+/// no trust is conferred; verification happens in [`verify_near_redirect_proof`].
+fn near_proof_from_input(
+    input: &NearRedirectProofInput,
+) -> Result<SigningProof, (StatusCode, String)> {
+    let approved_tx_hash = parse_hash(&input.approved_tx_hash)?;
+    let public_key = parse_hex(&input.public_key).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid public_key hex: {e}"),
+        )
+    })?;
+    let signature = parse_hex(&input.signature).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid signature hex: {e}"),
+        )
+    })?;
+    let access_key_scope = match &input.access_key_scope {
+        NearAccessKeyScopeInput::FullAccess => NearAccessKeyScope::FullAccess,
+        NearAccessKeyScopeInput::FunctionCall {
+            receiver_id,
+            method_names,
+        } => NearAccessKeyScope::FunctionCall {
+            receiver_id: receiver_id.clone(),
+            method_names: method_names.clone(),
+        },
+    };
+
+    let payload = NearRedirectProofPayload {
+        approved_tx_hash,
+        account_id: input.account_id.clone(),
+        public_key,
+        signature,
+        access_key_scope,
+        state: input.state.clone(),
+    };
+    Ok(SigningProof::NearRedirectProof(encode_near_redirect_proof(
+        &payload,
+    )))
+}
+
+/// Verify a NEAR redirect proof against the authoritative bound context, hash,
+/// wallet/callback URLs, and state secret, via
+/// [`NearRedirectSigningProvider::verify_resume`].
+///
+/// This is the reusable security core: hash binding + state echo + account
+/// binding + ed25519 signature + access-key scope + one-shot grant claim, all
+/// fail-closed. PR10 calls this once its gate store supplies the authoritative
+/// `context` + `approved_tx_hash` + the server-side `state_secret` it used at
+/// `initiate`.
+// PR10: the production caller is the gate-store-backed resume path wired in
+// PR10; in PR7/PR8 only the tests drive it (the handler fails closed before
+// reaching it because the authoritative binding is not yet persisted).
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn verify_near_redirect_proof(
+    grants: Arc<dyn SealedGrantStore>,
+    wallet_base_url: &str,
+    callback_url: &str,
+    state_secret: &[u8],
+    context: &SigningContext,
+    approved_tx_hash: &ApprovedTxHash,
+    proof: &SigningProof,
+) -> Result<(), SigningProviderError> {
+    let provider =
+        NearRedirectSigningProvider::new(wallet_base_url, callback_url, state_secret, grants);
+    provider
+        .verify_resume(context, approved_tx_hash, proof)
+        .await
+        .map(|_verified| ())
+}
+
+/// Resolve a `BlockedAttested` gate with a NEAR redirect proof.
+///
+/// Deserializes the proof, then — at the verified-proof boundary — defers the
+/// authoritative gate binding + broadcast handoff to PR10 (mirrors the injected
+/// path).
+pub(crate) async fn resolve_near_redirect_proof(
+    state: &Arc<GatewayState>,
+    _user_id: &str,
+    _gate_request_id: Uuid,
+    _thread_id: Option<String>,
+    input: NearRedirectProofInput,
+) -> Result<axum::Json<ActionResponse>, (StatusCode, String)> {
+    // Always validate the wire shape first so malformed proofs reject uniformly
+    // regardless of whether the composition layer is wired.
+    let _proof = near_proof_from_input(&input)?;
+
+    let Some(_grants) = state.attested_grant_store.clone() else {
+        // PR10: the reborn/composition layer wires the sealed-grant store and
+        // persists the authoritative `BlockedAttested` binding (ApprovedTxHash +
+        // SigningContext) into the gate store, AND carries the server-side
+        // `state_secret` + wallet/callback URLs used at `initiate`. Until then
+        // there is nothing authoritative to verify the proof against (and no
+        // secret to re-derive the bound `state`), so fail closed rather than
+        // trust caller-supplied context. `verify_near_redirect_proof` above is
+        // the crypto-real core PR10 will drive once that binding is available;
+        // the broadcast of the wallet-signed tx (ironclaw_chain_signing) and the
+        // `ResumeTurnRequest { attestation: Some(..) }` continuation through the
+        // existing `AttestedResumePort` gate-resolve path also land in PR10.
+        tracing::debug!(
+            "[gate_resolve] near-redirect proof received but attested signing composition is \
+             not wired (PR10); failing closed"
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Attested external-wallet signing is not enabled on this deployment.".to_string(),
+        ));
+    };
+
+    // PR10: with `_grants` present, look up the persisted `BlockedAttested` gate
+    // for `_gate_request_id`, recover its bound `SigningContext` +
+    // `ApprovedTxHash` + the `state_secret`/wallet URLs, call
+    // `verify_near_redirect_proof(...)`, and on success build `ResumeTurnRequest
+    // { attestation: Some(..) }` + dispatch the broadcast through the existing
+    // gate-resolve engine submission path. Not built in PR8.
     Err((
         StatusCode::SERVICE_UNAVAILABLE,
         "Attested external-wallet signing resume is not yet wired (pending PR10).".to_string(),
@@ -329,6 +478,128 @@ mod tests {
         let err = verify_injected_proof(store, &context, &hash, &proof)
             .await
             .expect_err("wrong signer must reject");
+        assert!(matches!(err, SigningProviderError::SignerMismatch));
+    }
+
+    // ── NEAR redirect proof (PR8) ──
+
+    const NEAR_WALLET_URL: &str = "https://wallet.near.org/sign";
+    const NEAR_CALLBACK_URL: &str = "https://ironclaw.example/api/chat/gate/resolve";
+    const NEAR_STATE_SECRET: &[u8] = b"server-side-state-secret";
+
+    fn near_ctx(account: &str) -> SigningContext {
+        SigningContext {
+            chain_id: ChainId::new("near:mainnet"),
+            key_or_account_id: KeyOrAccountId::new(account),
+            ..ctx(account)
+        }
+    }
+
+    #[test]
+    fn near_proof_from_input_rejects_bad_hash_length() {
+        let err = near_proof_from_input(&NearRedirectProofInput {
+            account_id: "alice.near".into(),
+            public_key: "11".repeat(32),
+            signature: "00".repeat(64),
+            approved_tx_hash: "00".repeat(16),
+            access_key_scope: NearAccessKeyScopeInput::FullAccess,
+            state: "deadbeef".into(),
+        })
+        .expect_err("short hash must reject");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn verify_near_redirect_proof_success_then_replay_fails() {
+        let store = Arc::new(InMemorySealedGrantStore::new());
+        let key = EdSigningKey::from_bytes(&[0x55u8; 32]);
+        let pubkey = key.verifying_key().to_bytes();
+        let account = "alice.near";
+        let context = near_ctx(account);
+        let hash = ApprovedTxHash::from_bytes([7u8; 32]);
+
+        let gk = GrantKey::from_context(&context, hash);
+        store
+            .seal(AttestedSigningGrant::seal(gk, 1_000, None))
+            .await
+            .expect("seal");
+
+        let sig = key.sign(hash.as_bytes());
+        let state = ironclaw_wallet_external::derive_state(NEAR_STATE_SECRET, &context, &hash);
+        let proof = near_proof_from_input(&NearRedirectProofInput {
+            account_id: account.into(),
+            public_key: lower_hex(&pubkey),
+            signature: lower_hex(&sig.to_bytes()),
+            approved_tx_hash: lower_hex(hash.as_bytes()),
+            access_key_scope: NearAccessKeyScopeInput::FullAccess,
+            state,
+        })
+        .expect("proof parses");
+
+        verify_near_redirect_proof(
+            store.clone(),
+            NEAR_WALLET_URL,
+            NEAR_CALLBACK_URL,
+            NEAR_STATE_SECRET,
+            &context,
+            &hash,
+            &proof,
+        )
+        .await
+        .expect("valid proof verifies through the web helper");
+
+        // Replay must fail closed (one-shot grant).
+        let err = verify_near_redirect_proof(
+            store,
+            NEAR_WALLET_URL,
+            NEAR_CALLBACK_URL,
+            NEAR_STATE_SECRET,
+            &context,
+            &hash,
+            &proof,
+        )
+        .await
+        .expect_err("replay fails closed");
+        assert!(matches!(err, SigningProviderError::GrantClaimFailed));
+    }
+
+    #[tokio::test]
+    async fn verify_near_redirect_proof_rejects_wrong_account() {
+        let store = Arc::new(InMemorySealedGrantStore::new());
+        let key = EdSigningKey::from_bytes(&[0x55u8; 32]);
+        let pubkey = key.verifying_key().to_bytes();
+        // Bind a different account than the proof claims.
+        let context = near_ctx("bob.near");
+        let hash = ApprovedTxHash::from_bytes([7u8; 32]);
+        let gk = GrantKey::from_context(&context, hash);
+        store
+            .seal(AttestedSigningGrant::seal(gk, 1_000, None))
+            .await
+            .expect("seal");
+
+        let sig = key.sign(hash.as_bytes());
+        let state = ironclaw_wallet_external::derive_state(NEAR_STATE_SECRET, &context, &hash);
+        let proof = near_proof_from_input(&NearRedirectProofInput {
+            account_id: "alice.near".into(),
+            public_key: lower_hex(&pubkey),
+            signature: lower_hex(&sig.to_bytes()),
+            approved_tx_hash: lower_hex(hash.as_bytes()),
+            access_key_scope: NearAccessKeyScopeInput::FullAccess,
+            state,
+        })
+        .expect("proof parses");
+
+        let err = verify_near_redirect_proof(
+            store,
+            NEAR_WALLET_URL,
+            NEAR_CALLBACK_URL,
+            NEAR_STATE_SECRET,
+            &context,
+            &hash,
+            &proof,
+        )
+        .await
+        .expect_err("wrong account must reject");
         assert!(matches!(err, SigningProviderError::SignerMismatch));
     }
 }
