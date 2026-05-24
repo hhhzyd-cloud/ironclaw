@@ -133,6 +133,9 @@ async-trait = "0.1"
 # hash); alloy bits build the binding's decoded-tx field.
 alloy-primitives = "1"
 ed25519-dalek = "2"
+# Lowercase-hex encoding of the EVM signer address for the PR14 custodial
+# raise→resolve end-to-end test.
+hex = "0.4"
 http = "1"
 http-body-util = "0.1"
 ironclaw_host_api = { path = "../ironclaw_host_api" }

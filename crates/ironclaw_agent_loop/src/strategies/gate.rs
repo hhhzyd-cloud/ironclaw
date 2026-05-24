@@ -63,6 +63,7 @@ pub(crate) enum GateKind {
     Approval,
     Auth,
     Resource,
+    Attested,
 }
 
 /// Strategy decision for a gate, plus the new `gate_state` slot value.
@@ -95,7 +96,7 @@ impl GateOutcome {
     /// executor honors it.
     pub(crate) fn validate_for_gate_kind(&self, kind: GateKind) -> Result<(), LoopFailureKind> {
         match (kind, self) {
-            (GateKind::Approval, GateOutcome::SkipAndContinue { .. }) => {
+            (GateKind::Approval | GateKind::Attested, GateOutcome::SkipAndContinue { .. }) => {
                 Err(LoopFailureKind::DriverBug)
             }
             _ => Ok(()),
