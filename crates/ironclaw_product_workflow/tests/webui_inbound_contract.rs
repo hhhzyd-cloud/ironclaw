@@ -172,7 +172,10 @@ fn resolve_gate_maps_attested_proof_to_canonical_command() {
     else {
         panic!("expected attested resolution");
     };
-    assert_eq!(kind, ironclaw_product_workflow::AttestedProofKind::InjectedWallet);
+    assert_eq!(
+        kind,
+        ironclaw_product_workflow::AttestedProofKind::InjectedWallet
+    );
     assert_eq!(approved_tx_hash_hex, "ab".repeat(32));
     assert!(proof_json.is_object());
 }
