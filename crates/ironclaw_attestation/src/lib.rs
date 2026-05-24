@@ -33,9 +33,22 @@ mod approved_tx_hash;
 mod canonical;
 mod decoded_tx;
 mod fields;
-mod grant;
-mod ledger;
 mod rendered;
+
+// `grant` / `ledger` are private to the crate, EXCEPT when the `contract-suite`
+// feature is on: the durable-backend crate (`ironclaw_attested_store`) invokes
+// the `#[macro_export]`ed contract macros whose bodies reference
+// `$crate::grant::contract::*` / `$crate::ledger::contract::*`, so those module
+// paths must be reachable from the consuming crate. The store impls and traits
+// stay re-exported below regardless; only the module visibility widens.
+#[cfg(not(feature = "contract-suite"))]
+mod grant;
+#[cfg(feature = "contract-suite")]
+pub mod grant;
+#[cfg(not(feature = "contract-suite"))]
+mod ledger;
+#[cfg(feature = "contract-suite")]
+pub mod ledger;
 
 pub use approved_tx_hash::compute_approved_tx_hash;
 pub use canonical::canonical_signing_bytes;

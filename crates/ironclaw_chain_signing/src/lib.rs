@@ -49,6 +49,8 @@
 #![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "broadcast-http")]
+pub(crate) mod broadcast_http;
 mod chain;
 mod custodial;
 mod error;

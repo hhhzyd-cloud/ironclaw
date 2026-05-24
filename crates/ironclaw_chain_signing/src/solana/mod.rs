@@ -16,6 +16,8 @@ pub mod policy;
 pub mod render;
 pub mod sign;
 
+#[cfg(feature = "broadcast-http")]
+pub use broadcast::JsonRpcSolanaBroadcaster;
 pub use broadcast::{SolanaBroadcastOutcome, SolanaBroadcaster};
 pub use policy::{SolanaTokenMetadata, check_cluster, check_token_metadata};
 pub use render::render_solana;

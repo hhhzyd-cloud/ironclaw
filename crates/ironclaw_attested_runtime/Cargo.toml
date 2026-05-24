@@ -15,6 +15,9 @@ dist = false
 
 [dependencies]
 async-trait = "0.1"
+# Serde derives so AttestedGateBinding persists as a single JSON column in the
+# durable binding stores (ironclaw_attested_store, PR12).
+serde = { version = "1", features = ["derive"] }
 
 # Crypto-free turn-coordination contract (the AttestedResumePort trait lives here).
 ironclaw_turns = { path = "../ironclaw_turns" }

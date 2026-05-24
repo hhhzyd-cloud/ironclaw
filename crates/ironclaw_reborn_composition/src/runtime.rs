@@ -74,12 +74,10 @@ use ironclaw_turns::{
 };
 use secrecy::SecretString;
 
+use crate::attested::LocalDevAttestedComposition;
 use crate::projection::{RebornProjectionServices, build_reborn_projection_services};
 use crate::runtime_input::{PollSettings, RebornRuntimeIdentity, RebornRuntimeInput};
-use crate::{
-    RebornAttestedComposition, RebornBuildError, RebornCompositionProfile, RebornServices,
-    build_reborn_services,
-};
+use crate::{RebornBuildError, RebornCompositionProfile, RebornServices, build_reborn_services};
 
 mod local_dev;
 mod skills;
@@ -176,7 +174,7 @@ pub struct RebornRuntime {
     /// Attested-signing signer-continuation composition (PR10): the shared gate
     /// binding store + the assembled driver dispatched when a turn reaches
     /// `AttestedResolved`.
-    attested_signing: RebornAttestedComposition,
+    attested_signing: LocalDevAttestedComposition,
     thread_service: Arc<InMemorySessionThreadService>,
     thread_scope: ThreadScope,
     worker_handle: JoinHandle<()>,
@@ -217,7 +215,7 @@ impl RebornRuntime {
     /// authoritative binding when raising a `BlockedAttested` gate and, once the
     /// turn reaches `AttestedResolved`, drives the deterministic sign +
     /// broadcast continuation.
-    pub fn attested_signing(&self) -> &RebornAttestedComposition {
+    pub fn attested_signing(&self) -> &LocalDevAttestedComposition {
         &self.attested_signing
     }
 
@@ -927,7 +925,7 @@ pub async fn build_reborn_runtime(
 /// key; durable persistence of grants/ledger/keystore is PR12.
 fn build_attested_composition(
     bindings: Arc<InMemoryAttestedGateBindingStore>,
-) -> RebornAttestedComposition {
+) -> LocalDevAttestedComposition {
     // Local-dev master key for the custodial keystore AAD. Production wires a
     // real master key (OS keychain / KMS); this dev key never signs mainnet
     // because the ship-gate refuses it without secure custody.
@@ -941,7 +939,7 @@ fn build_attested_composition(
     let ship_gate = CustodialMainnetShipGate::from_env().build_chain_ship_gate(None);
 
     let grants = Arc::new(InMemorySealedGrantStore::new());
-    RebornAttestedComposition::new(
+    LocalDevAttestedComposition::new_in_memory(
         bindings,
         keystore,
         ship_gate,

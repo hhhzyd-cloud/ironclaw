@@ -191,15 +191,25 @@ impl SigningLedger for InMemorySigningLedger {
 
 /// Canonical contract suite for [`SigningLedger`] implementations. Mirrors the
 /// grant-store and predicate-state contract pattern.
-#[cfg(test)]
-pub(crate) mod contract {
+///
+/// Exposed publicly behind the `contract-suite` feature so the durable-backend
+/// crate (`ironclaw_attested_store`) can drive its PG / libSQL ledgers through
+/// the same cases; otherwise `#[cfg(test)]` keeps it crate-private.
+#[cfg(any(test, feature = "contract-suite"))]
+pub mod contract {
+    // `pub` case fns are invoked by the `#[macro_export]`ed contract macro from
+    // the durable-backend crate; the lint cannot see that cross-crate use under
+    // a plain `#[cfg(test)]` build, so allow it here.
+    #![allow(unreachable_pub)]
+
     use super::*;
 
-    fn gate() -> GateRef {
+    /// The fixed `gate_ref` every ledger contract case operates on.
+    pub fn gate() -> GateRef {
         GateRef::new("gate:ledger")
     }
 
-    pub(crate) async fn full_valid_sequence<L: SigningLedger>(ledger: L) {
+    pub async fn full_valid_sequence<L: SigningLedger>(ledger: L) {
         use SigningLedgerState::*;
         let g = gate();
         ledger.create(&g).await.expect("create");
@@ -210,13 +220,13 @@ pub(crate) mod contract {
         }
     }
 
-    pub(crate) async fn second_create_is_already_exists<L: SigningLedger>(ledger: L) {
+    pub async fn second_create_is_already_exists<L: SigningLedger>(ledger: L) {
         let g = gate();
         ledger.create(&g).await.expect("create");
         assert_eq!(ledger.create(&g).await, Err(LedgerError::AlreadyExists));
     }
 
-    pub(crate) async fn advance_missing_is_not_found<L: SigningLedger>(ledger: L) {
+    pub async fn advance_missing_is_not_found<L: SigningLedger>(ledger: L) {
         assert_eq!(
             ledger.advance(&gate(), SigningLedgerState::Signing).await,
             Err(LedgerError::NotFound)
@@ -224,7 +234,7 @@ pub(crate) mod contract {
         assert_eq!(ledger.state(&gate()).await, Err(LedgerError::NotFound));
     }
 
-    pub(crate) async fn skip_forward_is_invalid<L: SigningLedger>(ledger: L) {
+    pub async fn skip_forward_is_invalid<L: SigningLedger>(ledger: L) {
         let g = gate();
         ledger.create(&g).await.expect("create");
         // Approved -> Signed skips Signing.
@@ -237,7 +247,7 @@ pub(crate) mod contract {
         );
     }
 
-    pub(crate) async fn regression_is_invalid<L: SigningLedger>(ledger: L) {
+    pub async fn regression_is_invalid<L: SigningLedger>(ledger: L) {
         use SigningLedgerState::*;
         let g = gate();
         ledger.create(&g).await.expect("create");
@@ -253,7 +263,7 @@ pub(crate) mod contract {
         );
     }
 
-    pub(crate) async fn broadcast_idempotency_guard<L: SigningLedger>(ledger: L) {
+    pub async fn broadcast_idempotency_guard<L: SigningLedger>(ledger: L) {
         use SigningLedgerState::*;
         let g = gate();
         ledger.create(&g).await.expect("create");
@@ -279,7 +289,7 @@ pub(crate) mod contract {
         ledger.advance(&g, Finalized).await.expect("finalize");
     }
 
-    pub(crate) async fn terminal_states_never_advance<L: SigningLedger>(ledger: L) {
+    pub async fn terminal_states_never_advance<L: SigningLedger>(ledger: L) {
         use SigningLedgerState::*;
         let g = gate();
         ledger.create(&g).await.expect("create");

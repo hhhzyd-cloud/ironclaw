@@ -55,6 +55,7 @@ mod ship_gate;
 
 pub use binding::{
     AttestedGateBinding, AttestedGateBindingStore, InMemoryAttestedGateBindingStore,
+    SyncBindingRead,
 };
 pub use driver::{
     AttestedSignerContinuationDriver, Broadcaster, ContinuationError, CustodialSignerLike,

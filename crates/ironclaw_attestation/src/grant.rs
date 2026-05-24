@@ -226,14 +226,24 @@ impl SealedGrantStore for InMemorySealedGrantStore {
 ///
 /// Mirrors `predicate_backend_contract_test!` in `ironclaw_hooks`: the
 /// behavioural contract lives once and every backend (in-memory here, durable
-/// PG / libSQL in stacked follow-ups) is driven through it. Invoke with a label
-/// and a zero-arg factory closure returning a fresh store.
-#[cfg(test)]
-pub(crate) mod contract {
+/// PG / libSQL in `ironclaw_attested_store`) is driven through it. Invoke with a
+/// label and a zero-arg factory closure returning a fresh store.
+///
+/// Exposed publicly behind the `contract-suite` feature so the durable-backend
+/// crate can run the *same* cases against its PG / libSQL stores; otherwise
+/// `#[cfg(test)]` keeps it private to this crate's own test tree.
+#[cfg(any(test, feature = "contract-suite"))]
+pub mod contract {
+    // The case fns are `pub` so the `#[macro_export]`ed contract macro can call
+    // them from the durable-backend crate; under a plain `#[cfg(test)]` build
+    // (feature off) the lint cannot see that cross-crate use, so allow it here.
+    #![allow(unreachable_pub)]
+
     use super::*;
     use std::sync::Arc;
 
-    pub(crate) fn key(seed: u8) -> GrantKey {
+    /// A deterministic [`GrantKey`] seeded by `seed` (varies the approved hash).
+    pub fn key(seed: u8) -> GrantKey {
         GrantKey {
             tenant: TenantId::new("tenant-a"),
             user: UserId::new("user-1"),
@@ -245,7 +255,7 @@ pub(crate) mod contract {
         }
     }
 
-    pub(crate) async fn seal_then_claim_succeeds<S: SealedGrantStore>(store: S) {
+    pub async fn seal_then_claim_succeeds<S: SealedGrantStore>(store: S) {
         let k = key(1);
         store
             .seal(AttestedSigningGrant::seal(k.clone(), 1_000, None))
@@ -256,7 +266,7 @@ pub(crate) mod contract {
         assert_eq!(claimed.created_at_ms, 1_000);
     }
 
-    pub(crate) async fn second_claim_is_already_claimed<S: SealedGrantStore>(store: S) {
+    pub async fn second_claim_is_already_claimed<S: SealedGrantStore>(store: S) {
         let k = key(2);
         store
             .seal(AttestedSigningGrant::seal(k.clone(), 0, None))
@@ -266,11 +276,11 @@ pub(crate) mod contract {
         assert_eq!(store.claim(&k).await, Err(GrantError::AlreadyClaimed));
     }
 
-    pub(crate) async fn claim_unsealed_is_not_found<S: SealedGrantStore>(store: S) {
+    pub async fn claim_unsealed_is_not_found<S: SealedGrantStore>(store: S) {
         assert_eq!(store.claim(&key(3)).await, Err(GrantError::NotFound));
     }
 
-    pub(crate) async fn claim_mismatched_component_is_not_found<S: SealedGrantStore>(store: S) {
+    pub async fn claim_mismatched_component_is_not_found<S: SealedGrantStore>(store: S) {
         let sealed = key(4);
         store
             .seal(AttestedSigningGrant::seal(sealed.clone(), 0, None))
@@ -285,7 +295,7 @@ pub(crate) mod contract {
         assert_eq!(store.claim(&hash_mismatch).await, Err(GrantError::NotFound));
     }
 
-    pub(crate) async fn double_seal_is_already_sealed<S: SealedGrantStore>(store: S) {
+    pub async fn double_seal_is_already_sealed<S: SealedGrantStore>(store: S) {
         let k = key(5);
         store
             .seal(AttestedSigningGrant::seal(k.clone(), 0, None))
@@ -297,7 +307,7 @@ pub(crate) mod contract {
         );
     }
 
-    pub(crate) async fn concurrent_claims_yield_exactly_one_winner<S>(store: S)
+    pub async fn concurrent_claims_yield_exactly_one_winner<S>(store: S)
     where
         S: SealedGrantStore + 'static,
     {

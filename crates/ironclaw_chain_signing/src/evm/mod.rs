@@ -9,6 +9,8 @@ pub mod policy;
 pub mod render;
 pub mod sign;
 
+#[cfg(feature = "broadcast-http")]
+pub use broadcast::JsonRpcEvmBroadcaster;
 pub use broadcast::{EvmBroadcastOutcome, EvmBroadcaster};
 pub use decode::{decode_eip1559, decode_eip2930, decode_legacy};
 pub use policy::{

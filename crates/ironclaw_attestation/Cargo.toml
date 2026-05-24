@@ -12,12 +12,22 @@ repository = "https://github.com/nearai/ironclaw"
 [package.metadata.dist]
 dist = false
 
+[features]
+default = []
+# Expose the `*_contract_cases!` suites publicly (instead of only to this
+# crate's own `#[cfg(test)]` tree) so the durable-backend crate
+# (`ironclaw_attested_store`) can drive its PG / libSQL stores through the SAME
+# behavioural contract. Pulls in tokio because the concurrent-claim case spawns
+# tasks. No chain/secret deps — the architecture purity test still holds.
+contract-suite = ["dep:tokio"]
+
 [dependencies]
 async-trait = "0.1"
 ironclaw_signing_provider = { path = "../ironclaw_signing_provider" }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"], optional = true }
 
 [dev-dependencies]
 serde_json = "1"
