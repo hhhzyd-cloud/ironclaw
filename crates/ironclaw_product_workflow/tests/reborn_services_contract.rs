@@ -280,6 +280,7 @@ impl TurnCoordinator for FakeTurnCoordinator {
             gate_ref,
             failure: None,
             event_cursor: EventCursor(17),
+            expected_tx_hash: None,
         })
     }
 }

@@ -338,6 +338,7 @@ fn blocked_exit_maps_to_block_run_outcome_with_verified_checkpoint_and_gate_ref(
     let decision = LoopExit::Blocked(LoopBlocked {
         kind: LoopBlockedKind::Approval,
         gate_ref: loop_gate_ref,
+        expected_tx_hash: None,
         checkpoint_id,
         state_ref: state_ref.clone(),
         exit_id: exit_id("exit:blocked"),
@@ -370,6 +371,7 @@ fn blocked_exit_requires_host_verified_gate_and_checkpoint_before_trusted_mappin
     let decision = LoopExit::Blocked(LoopBlocked {
         kind: LoopBlockedKind::Approval,
         gate_ref: loop_gate_ref("gate:approval-gate"),
+        expected_tx_hash: None,
         checkpoint_id: TurnCheckpointId::new(),
         state_ref: checkpoint_state_ref(),
         exit_id: exit_id("exit:unverified-blocked"),
@@ -751,6 +753,7 @@ fn blocked_variants_map_to_correct_blocked_reason() {
         let decision = LoopExit::Blocked(LoopBlocked {
             kind,
             gate_ref: lg,
+            expected_tx_hash: None,
             checkpoint_id,
             state_ref: state_ref.clone(),
             exit_id: exit_id("exit:blocked-variant"),
@@ -764,6 +767,9 @@ fn blocked_variants_map_to_correct_blocked_reason() {
             LoopBlockedKind::Approval => BlockedReason::Approval { gate_ref },
             LoopBlockedKind::Auth => BlockedReason::Auth { gate_ref },
             LoopBlockedKind::Resource => BlockedReason::Resource { gate_ref },
+            // Attested is exercised separately in the attested-resume contract
+            // tests; this loop only covers the non-attested kinds.
+            LoopBlockedKind::Attested => unreachable!("attested kind not iterated here"),
         };
 
         assert_eq!(decision.violation, None);
@@ -872,6 +878,8 @@ fn terminal_statuses_release_lock_and_non_terminal_keep_it() {
         TurnStatus::BlockedApproval,
         TurnStatus::BlockedAuth,
         TurnStatus::BlockedResource,
+        TurnStatus::BlockedAttested,
+        TurnStatus::AttestedResolved,
         TurnStatus::CancelRequested,
         TurnStatus::Cancelled,
         TurnStatus::Completed,
@@ -884,6 +892,8 @@ fn terminal_statuses_release_lock_and_non_terminal_keep_it() {
             TurnStatus::BlockedApproval => (false, true),
             TurnStatus::BlockedAuth => (false, true),
             TurnStatus::BlockedResource => (false, true),
+            TurnStatus::BlockedAttested => (false, true),
+            TurnStatus::AttestedResolved => (false, true),
             TurnStatus::CancelRequested => (false, true),
             TurnStatus::Cancelled => (true, false),
             TurnStatus::Completed => (true, false),

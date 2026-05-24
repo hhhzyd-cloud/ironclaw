@@ -173,6 +173,7 @@ async fn turn_lifecycle_projection_replays_submit_block_resume_complete_without_
             )
             .unwrap(),
             idempotency_key: IdempotencyKey::new("idem-turn-events-resume").unwrap(),
+            attestation: None,
         })
         .await
         .unwrap();
@@ -793,6 +794,7 @@ async fn resume_turn_wakes_runner_for_same_run_after_requeue() {
             source_binding_ref: SourceBindingRef::new("source-web-resumed").unwrap(),
             reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web-resumed").unwrap(),
             idempotency_key: IdempotencyKey::new("idem-resume-a").unwrap(),
+            attestation: None,
         })
         .await
         .unwrap();
@@ -918,6 +920,7 @@ async fn resume_turn_ignores_wake_notification_panic_after_requeue() {
             source_binding_ref: SourceBindingRef::new("source-web-resumed").unwrap(),
             reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web-resumed").unwrap(),
             idempotency_key: IdempotencyKey::new("idem-resume-a").unwrap(),
+            attestation: None,
         })
         .await
         .unwrap();
@@ -1943,6 +1946,7 @@ async fn blocked_resume_and_recovery_required_keep_existing_admission_reservatio
             source_binding_ref: SourceBindingRef::new("source-web-resumed").unwrap(),
             reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web-resumed").unwrap(),
             idempotency_key: IdempotencyKey::new("idem-resume-a").unwrap(),
+            attestation: None,
         })
         .await
         .unwrap();
@@ -2149,6 +2153,7 @@ async fn resume_updates_persisted_run_binding_refs_and_replay_envelope() {
         source_binding_ref: SourceBindingRef::new("source-web-resumed").unwrap(),
         reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web-resumed").unwrap(),
         idempotency_key: IdempotencyKey::new("idem-resume-a").unwrap(),
+        attestation: None,
     };
 
     let resumed = coordinator
@@ -2468,6 +2473,7 @@ async fn idempotency_persistence_snapshot_retains_each_operation_kind_capacity()
             source_binding_ref: SourceBindingRef::new("source-web-resumed").unwrap(),
             reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web-resumed").unwrap(),
             idempotency_key: IdempotencyKey::new("idem-resume-a").unwrap(),
+            attestation: None,
         })
         .await
         .unwrap();
@@ -2565,6 +2571,7 @@ async fn idempotency_replay_helpers_require_matching_operation_kind() {
             source_binding_ref: SourceBindingRef::new("source-web-resumed").unwrap(),
             reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web-resumed").unwrap(),
             idempotency_key: IdempotencyKey::new("idem-resume-a").unwrap(),
+            attestation: None,
         })
         .await
         .unwrap();
@@ -3408,6 +3415,7 @@ async fn blocked_run_persists_checkpoint_and_keeps_same_thread_lock_until_resume
         source_binding_ref: SourceBindingRef::new("source-web").unwrap(),
         reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web").unwrap(),
         idempotency_key: IdempotencyKey::new("idem-resume-a").unwrap(),
+        attestation: None,
     };
     let resumed = coordinator
         .resume_turn(resume_request.clone())
@@ -3464,6 +3472,7 @@ async fn resume_turn_from_foreign_actor_is_denied_without_requeueing_run() {
             source_binding_ref: SourceBindingRef::new("source-web").unwrap(),
             reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web").unwrap(),
             idempotency_key: IdempotencyKey::new("idem-resume-foreign-actor").unwrap(),
+            attestation: None,
         })
         .await
         .unwrap_err();
@@ -3605,6 +3614,7 @@ async fn resume_turn_with_wrong_gate_resolution_ref_is_invalid_request() {
             source_binding_ref: SourceBindingRef::new("source-web").unwrap(),
             reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web").unwrap(),
             idempotency_key: IdempotencyKey::new("idem-resume-wrong-gate").unwrap(),
+            attestation: None,
         })
         .await
         .unwrap_err();
@@ -4103,6 +4113,7 @@ impl TurnRunTransitionPort for AtomicLoopExitPort {
             received_at: received_at(),
             checkpoint_id: None,
             gate_ref: None,
+            expected_tx_hash: None,
             failure: None,
             event_cursor: EventCursor(1),
         })

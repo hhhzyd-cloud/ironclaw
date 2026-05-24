@@ -60,6 +60,11 @@ pub struct InMemoryTurnStateStore {
     inner: Mutex<Inner>,
     submit_idempotency_ready: Condvar,
     admission_limit_provider: Arc<dyn TurnAdmissionLimitProvider>,
+    /// Injected verifier for `BlockedAttested` resumes. `None` means no attested
+    /// gate can be resumed (resume fails closed). Mirrors how the admission
+    /// limit provider is injected; the implementation lives outside this
+    /// crypto-free crate.
+    attested_resume_port: Option<Arc<dyn crate::AttestedResumePort>>,
 }
 
 impl Default for InMemoryTurnStateStore {
@@ -119,6 +124,7 @@ struct RunRecord {
     reply_target_binding_ref: ReplyTargetBindingRef,
     checkpoint_id: Option<TurnCheckpointId>,
     gate_ref: Option<crate::GateRef>,
+    expected_tx_hash: Option<crate::ApprovedTxHashRef>,
     failure: Option<SanitizedFailure>,
     event_cursor: EventCursor,
     runner_id: Option<crate::TurnRunnerId>,
@@ -148,6 +154,40 @@ struct PersistedIdempotencyKey {
     operation: TurnIdempotencyOperationKind,
     run_id: Option<TurnRunId>,
     key: IdempotencyKey,
+}
+
+/// Where a resumed run goes once its flat checks pass, keyed by the blocked
+/// status it is resuming from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeTarget {
+    /// `Approval`/`Auth`/`Resource`: requeue onto the normal agent loop.
+    AgentLoopRequeue,
+    /// `BlockedAttested`: validate the attestation and hand off to the
+    /// straight-line signer continuation, never the agent-loop queue.
+    AttestedSignerContinuation,
+}
+
+/// Classify a record's current status into a resume target, rejecting any
+/// non-resumable status. Centralizing this keeps the resume dispatch split
+/// exhaustive over `TurnStatus`.
+fn resume_target_status(status: TurnStatus) -> Result<ResumeTarget, TurnError> {
+    match status {
+        TurnStatus::BlockedApproval | TurnStatus::BlockedAuth | TurnStatus::BlockedResource => {
+            Ok(ResumeTarget::AgentLoopRequeue)
+        }
+        TurnStatus::BlockedAttested => Ok(ResumeTarget::AttestedSignerContinuation),
+        TurnStatus::Queued
+        | TurnStatus::Running
+        | TurnStatus::AttestedResolved
+        | TurnStatus::CancelRequested
+        | TurnStatus::Cancelled
+        | TurnStatus::Completed
+        | TurnStatus::Failed
+        | TurnStatus::RecoveryRequired => Err(TurnError::InvalidTransition {
+            from: status,
+            to: TurnStatus::Queued,
+        }),
+    }
 }
 
 fn profile_resolution_error_to_turn_error(error: RunProfileResolutionError) -> TurnError {
@@ -197,7 +237,18 @@ impl InMemoryTurnStateStore {
             }),
             submit_idempotency_ready: Condvar::new(),
             admission_limit_provider: Arc::new(AllowAllTurnAdmissionLimitProvider),
+            attested_resume_port: None,
         }
+    }
+
+    /// Inject the verifier used to validate `BlockedAttested` resumes.
+    ///
+    /// The implementation lives outside `ironclaw_turns`. Without it, attested
+    /// resumes fail closed. This is a builder so existing construction paths are
+    /// unchanged.
+    pub fn with_attested_resume_port(mut self, port: Arc<dyn crate::AttestedResumePort>) -> Self {
+        self.attested_resume_port = Some(port);
+        self
     }
 
     pub fn with_admission_limit_provider(
@@ -220,6 +271,7 @@ impl InMemoryTurnStateStore {
             }),
             submit_idempotency_ready: Condvar::new(),
             admission_limit_provider,
+            attested_resume_port: None,
         }
     }
 
@@ -257,6 +309,7 @@ impl InMemoryTurnStateStore {
             inner: Mutex::new(Inner::from_persistence_snapshot(snapshot, limits)?),
             submit_idempotency_ready: Condvar::new(),
             admission_limit_provider,
+            attested_resume_port: None,
         })
     }
 
@@ -481,6 +534,7 @@ impl TurnStateStore for InMemoryTurnStateStore {
             reply_target_binding_ref: request.reply_target_binding_ref.clone(),
             checkpoint_id: None,
             gate_ref: None,
+            expected_tx_hash: None,
             failure: None,
             event_cursor: cursor,
             runner_id: None,
@@ -539,7 +593,7 @@ impl TurnStateStore for InMemoryTurnStateStore {
         if let Some(result) = inner.resume_idempotency.get(&idempotency_key) {
             return result.clone();
         }
-        let result = inner.resume_turn_once(&request);
+        let result = inner.resume_turn_once(&request, self.attested_resume_port.as_deref());
         inner.remember_resume_idempotency(idempotency_key, result.clone(), Utc::now());
         result
     }
@@ -685,6 +739,7 @@ impl TurnRunTransitionPort for InMemoryTurnStateStore {
             record.status = request.reason.status();
             record.checkpoint_id = Some(request.checkpoint_id);
             record.gate_ref = Some(request.reason.gate_ref().clone());
+            record.expected_tx_hash = request.reason.expected_tx_hash().cloned();
             record.runner_id = None;
             record.lease_token = None;
             record.lease_expires_at = None;
@@ -807,6 +862,7 @@ impl Inner {
                     reply_target_binding_ref: run.reply_target_binding_ref,
                     checkpoint_id: run.checkpoint_id,
                     gate_ref: run.gate_ref,
+                    expected_tx_hash: run.expected_tx_hash,
                     failure: run.failure,
                     event_cursor: run.event_cursor,
                     runner_id: run.runner_id,
@@ -1206,21 +1262,17 @@ impl Inner {
     fn resume_turn_once(
         &mut self,
         request: &ResumeTurnRequest,
+        attested_resume_port: Option<&dyn crate::AttestedResumePort>,
     ) -> Result<ResumeTurnResponse, TurnError> {
         let mut record = self.take_record(request.run_id)?;
         let result = (|| {
+            // Flat checks shared by every blocked reason: scope, that the run is
+            // actually in a resumable blocked status, the resuming actor, and a
+            // matching gate reference.
             if record.scope != request.scope {
                 return Err(TurnError::ScopeNotFound);
             }
-            if !matches!(
-                record.status,
-                TurnStatus::BlockedApproval | TurnStatus::BlockedAuth | TurnStatus::BlockedResource
-            ) {
-                return Err(TurnError::InvalidTransition {
-                    from: record.status,
-                    to: TurnStatus::Queued,
-                });
-            }
+            let resume_target = resume_target_status(record.status)?;
             if record.actor != request.actor {
                 return Err(TurnError::Unauthorized);
             }
@@ -1229,24 +1281,104 @@ impl Inner {
                     reason: "gate resolution reference mismatch".to_string(),
                 });
             }
-            let now = Utc::now();
-            record.status = TurnStatus::Queued;
-            record.gate_ref = None;
-            record.source_binding_ref = request.source_binding_ref.clone();
-            record.reply_target_binding_ref = request.reply_target_binding_ref.clone();
-            record.event_cursor = self.next_cursor();
-            self.update_active_lock(&record, now);
-            self.queued_runs.push_back(record.run_id);
-            let response = ResumeTurnResponse {
-                run_id: record.run_id,
-                status: record.status,
-                event_cursor: record.event_cursor,
-            };
-            self.push_event(&record, TurnEventKind::Resumed, None);
-            Ok(response)
+
+            // Dispatch by blocked reason. The attested path validates the
+            // untrusted claim through the injected port and hands off to a
+            // straight-line signer continuation; it must NOT requeue the agent
+            // loop. Every other blocked reason keeps its existing behavior.
+            match resume_target {
+                ResumeTarget::AgentLoopRequeue => {
+                    self.resume_standard_blocked(&mut record, request)
+                }
+                ResumeTarget::AttestedSignerContinuation => {
+                    self.resume_attested_blocked(&mut record, request, attested_resume_port)
+                }
+            }
         })();
         self.records.insert(record.run_id, record);
         result
+    }
+
+    /// Resume an `Approval`/`Auth`/`Resource` gate: clear the gate and requeue
+    /// the run onto the normal agent loop. Behavior is intentionally unchanged
+    /// from the pre-split implementation.
+    fn resume_standard_blocked(
+        &mut self,
+        record: &mut RunRecord,
+        request: &ResumeTurnRequest,
+    ) -> Result<ResumeTurnResponse, TurnError> {
+        let now = Utc::now();
+        record.status = TurnStatus::Queued;
+        record.gate_ref = None;
+        record.expected_tx_hash = None;
+        record.source_binding_ref = request.source_binding_ref.clone();
+        record.reply_target_binding_ref = request.reply_target_binding_ref.clone();
+        record.event_cursor = self.next_cursor();
+        self.update_active_lock(record, now);
+        self.queued_runs.push_back(record.run_id);
+        let response = ResumeTurnResponse {
+            run_id: record.run_id,
+            status: record.status,
+            event_cursor: record.event_cursor,
+        };
+        self.push_event(record, TurnEventKind::Resumed, None);
+        Ok(response)
+    }
+
+    /// Resume a `BlockedAttested` gate. Requires the untrusted attestation claim
+    /// to be present (else fail closed), delegates verification to the injected
+    /// `AttestedResumePort`, and on success transitions to the deterministic
+    /// signer-continuation status `AttestedResolved`. The crypto-free store
+    /// never calls a signer or performs chain I/O here, and never requeues the
+    /// agent loop for this reason.
+    fn resume_attested_blocked(
+        &mut self,
+        record: &mut RunRecord,
+        request: &ResumeTurnRequest,
+        attested_resume_port: Option<&dyn crate::AttestedResumePort>,
+    ) -> Result<ResumeTurnResponse, TurnError> {
+        let attestation =
+            request
+                .attestation
+                .as_ref()
+                .ok_or_else(|| TurnError::InvalidRequest {
+                    reason: "attested resume requires an attestation claim".to_string(),
+                })?;
+        let expected_tx_hash = record.expected_tx_hash.as_ref().ok_or_else(|| {
+            // A run in BlockedAttested without a persisted binding is a store
+            // invariant violation; fail closed rather than resume.
+            TurnError::Conflict {
+                reason: "attested gate missing expected transaction binding".to_string(),
+            }
+        })?;
+        let port = attested_resume_port.ok_or_else(|| TurnError::Unavailable {
+            reason: "attested resume port not configured".to_string(),
+        })?;
+        port.verify_attested_resume(crate::AttestedResumeRequest {
+            gate_ref: &request.gate_resolution_ref,
+            attestation,
+            expected_tx_hash,
+        })
+        .map_err(|rejection| TurnError::InvalidRequest {
+            reason: format!("attested resume rejected: {}", rejection.category()),
+        })?;
+
+        let now = Utc::now();
+        record.status = TurnStatus::AttestedResolved;
+        // The binding stays on the record for the signer continuation; only the
+        // gate reference is cleared because the gate is resolved.
+        record.gate_ref = None;
+        record.source_binding_ref = request.source_binding_ref.clone();
+        record.reply_target_binding_ref = request.reply_target_binding_ref.clone();
+        record.event_cursor = self.next_cursor();
+        self.update_active_lock(record, now);
+        let response = ResumeTurnResponse {
+            run_id: record.run_id,
+            status: record.status,
+            event_cursor: record.event_cursor,
+        };
+        self.push_event(record, TurnEventKind::Resumed, None);
+        Ok(response)
     }
 
     fn request_cancel_once(
@@ -1274,8 +1406,14 @@ impl Inner {
                 | TurnStatus::BlockedApproval
                 | TurnStatus::BlockedAuth
                 | TurnStatus::BlockedResource
+                | TurnStatus::BlockedAttested
                 | TurnStatus::RecoveryRequired => (TurnStatus::Cancelled, TurnEventKind::Cancelled),
-                TurnStatus::Running | TurnStatus::CancelRequested => {
+                // A resolved attested gate has handed off to a signer
+                // continuation that may be mid-flight; treat it like `Running`
+                // and request a two-phase cancel rather than terminating here.
+                TurnStatus::Running
+                | TurnStatus::CancelRequested
+                | TurnStatus::AttestedResolved => {
                     (TurnStatus::CancelRequested, TurnEventKind::CancelRequested)
                 }
                 status => {
@@ -1527,6 +1665,7 @@ impl Inner {
         record.status = reason.status();
         record.checkpoint_id = Some(checkpoint_id);
         record.gate_ref = Some(reason.gate_ref().clone());
+        record.expected_tx_hash = reason.expected_tx_hash().cloned();
         record.runner_id = None;
         record.lease_token = None;
         record.lease_expires_at = None;
@@ -1834,6 +1973,7 @@ impl RunRecord {
             resolved_model_route: self.resolved_model_route.clone(),
             checkpoint_id: self.checkpoint_id,
             gate_ref: self.gate_ref.clone(),
+            expected_tx_hash: self.expected_tx_hash.clone(),
             failure: self.failure.clone(),
             event_cursor: self.event_cursor,
             runner_id: self.runner_id,
@@ -1861,6 +2001,7 @@ impl RunRecord {
             received_at: self.received_at,
             checkpoint_id: self.checkpoint_id,
             gate_ref: self.gate_ref.clone(),
+            expected_tx_hash: self.expected_tx_hash.clone(),
             failure: self.failure.clone(),
             event_cursor: self.event_cursor,
         }
