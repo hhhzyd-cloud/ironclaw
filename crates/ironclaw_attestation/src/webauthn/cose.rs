@@ -121,19 +121,28 @@ impl CosePublicKey {
     }
 
     /// Project a parsed [`CoseKey`] into a supported [`CosePublicKey`].
+    ///
+    /// The `(kty, crv, alg)` triple is matched *together* to defeat
+    /// algorithm-confusion: an EC2/P-256 key may only carry `alg` absent or
+    /// `ES256`, and an OKP/Ed25519 key may only carry `alg` absent or `EdDSA`.
+    /// A cross combination (e.g. EC2/P-256 tagged `alg=EdDSA`, or OKP/Ed25519
+    /// tagged `alg=ES256`) is rejected fail-closed rather than silently coerced
+    /// to whatever the `kty`/`crv` implies. `alg` is OPTIONAL in COSE_Key, so
+    /// absence is permitted and the concrete verifier is derived from
+    /// `kty`+`crv`; but a *present* `alg` MUST be consistent with the curve.
     pub fn from_cose_key(key: &CoseKey) -> Result<Self, CoseError> {
-        // `alg`, when present, must be one we support. (It is OPTIONAL in
-        // COSE_Key; we additionally derive the algorithm from kty+crv so a
-        // missing alg is not by itself fatal, but a present-and-unsupported alg
-        // is — fail-closed.)
-        match key.alg {
-            // `alg` is OPTIONAL in COSE_Key (None) or one we support — proceed
-            // to derive the concrete algorithm from kty+crv below.
-            None
-            | Some(RegisteredLabelWithPrivate::Assigned(Algorithm::ES256 | Algorithm::EdDSA)) => {}
-            // A present-but-unsupported assigned alg, or any non-assigned
-            // (text/private) label, is fail-closed.
-            Some(_) => return Err(CoseError::UnsupportedAlgorithm),
+        /// Whether a present `alg` matches the expected assigned algorithm.
+        /// `None` (absent) is always permitted; any other assigned/text/private
+        /// label is a mismatch.
+        fn alg_ok(
+            alg: &Option<RegisteredLabelWithPrivate<Algorithm>>,
+            expected: Algorithm,
+        ) -> bool {
+            match alg {
+                None => true,
+                Some(RegisteredLabelWithPrivate::Assigned(a)) => *a == expected,
+                Some(_) => false,
+            }
         }
 
         match key.kty {
@@ -141,6 +150,11 @@ impl CosePublicKey {
                 let crv = param_crv(&key.params, Ec2KeyParameter::Crv as i64)
                     .ok_or(CoseError::UnsupportedAlgorithm)?;
                 if crv != EllipticCurve::P_256 as i64 {
+                    return Err(CoseError::UnsupportedAlgorithm);
+                }
+                // EC2/P-256 binds to ES256: reject a present, non-ES256 alg
+                // (incl. EdDSA) before deriving the ES256 verifier.
+                if !alg_ok(&key.alg, Algorithm::ES256) {
                     return Err(CoseError::UnsupportedAlgorithm);
                 }
                 let x = param_bytes(&key.params, Ec2KeyParameter::X as i64, "EC2 x")?;
@@ -160,6 +174,11 @@ impl CosePublicKey {
                 let crv = param_crv(&key.params, OkpKeyParameter::Crv as i64)
                     .ok_or(CoseError::UnsupportedAlgorithm)?;
                 if crv != EllipticCurve::Ed25519 as i64 {
+                    return Err(CoseError::UnsupportedAlgorithm);
+                }
+                // OKP/Ed25519 binds to EdDSA: reject a present, non-EdDSA alg
+                // (incl. ES256) before deriving the Ed25519 verifier.
+                if !alg_ok(&key.alg, Algorithm::EdDSA) {
                     return Err(CoseError::UnsupportedAlgorithm);
                 }
                 let x = param_bytes(&key.params, OkpKeyParameter::X as i64, "OKP x")?;
@@ -278,6 +297,79 @@ mod tests {
             }
             _ => panic!("expected ES256"),
         }
+    }
+
+    #[test]
+    fn ec2_p256_with_eddsa_alg_rejected() {
+        // Algorithm confusion: an EC2/P-256 key explicitly tagged alg=EdDSA
+        // must NOT be coerced to ES256. Reject fail-closed.
+        let key = CoseKeyBuilder::new_ec2_pub_key(
+            iana::EllipticCurve::P_256,
+            vec![7u8; 32],
+            vec![9u8; 32],
+        )
+        .algorithm(iana::Algorithm::EdDSA)
+        .build();
+        assert_eq!(
+            CosePublicKey::from_cose_key(&key),
+            Err(CoseError::UnsupportedAlgorithm)
+        );
+    }
+
+    #[test]
+    fn ec2_p256_with_es256_alg_accepted() {
+        // The matching combination still parses.
+        let key = CoseKeyBuilder::new_ec2_pub_key(
+            iana::EllipticCurve::P_256,
+            vec![7u8; 32],
+            vec![9u8; 32],
+        )
+        .algorithm(iana::Algorithm::ES256)
+        .build();
+        assert!(matches!(
+            CosePublicKey::from_cose_key(&key),
+            Ok(CosePublicKey::Es256 { .. })
+        ));
+    }
+
+    #[test]
+    fn okp_ed25519_with_es256_alg_rejected() {
+        // Algorithm confusion in the other direction: an OKP/Ed25519 key tagged
+        // alg=ES256 must NOT be coerced to Ed25519.
+        let key = CoseKeyBuilder::new_okp_key()
+            .param(
+                iana::OkpKeyParameter::Crv as i64,
+                coset::cbor::value::Value::from(iana::EllipticCurve::Ed25519 as i64),
+            )
+            .param(
+                iana::OkpKeyParameter::X as i64,
+                coset::cbor::value::Value::Bytes(vec![3u8; 32]),
+            )
+            .algorithm(iana::Algorithm::ES256)
+            .build();
+        assert_eq!(
+            CosePublicKey::from_cose_key(&key),
+            Err(CoseError::UnsupportedAlgorithm)
+        );
+    }
+
+    #[test]
+    fn okp_ed25519_with_eddsa_alg_accepted() {
+        let key = CoseKeyBuilder::new_okp_key()
+            .param(
+                iana::OkpKeyParameter::Crv as i64,
+                coset::cbor::value::Value::from(iana::EllipticCurve::Ed25519 as i64),
+            )
+            .param(
+                iana::OkpKeyParameter::X as i64,
+                coset::cbor::value::Value::Bytes(vec![3u8; 32]),
+            )
+            .algorithm(iana::Algorithm::EdDSA)
+            .build();
+        assert!(matches!(
+            CosePublicKey::from_cose_key(&key),
+            Ok(CosePublicKey::Ed25519 { .. })
+        ));
     }
 
     #[test]

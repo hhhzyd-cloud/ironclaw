@@ -39,7 +39,8 @@ pub(crate) mod verify;
 pub use cose::{CoseError, CosePublicKey};
 pub use registry::{
     Aaguid, AttestationPolicy, BackupFlagPolicy, BootstrapPolicy,
-    InMemoryWebAuthnCredentialRegistry, OriginPolicy, RegisteredCredential, RegistrationError,
-    RegistrationRequest, SignCountPolicy, WebAuthnCredentialRegistry,
+    InMemoryWebAuthnCredentialRegistry, OriginContext, OriginPolicy, RegisteredCredential,
+    RegistrationError, RegistrationRequest, SignCountPolicy, StandardOriginPolicy,
+    WebAuthnCredentialRegistry,
 };
 pub use verify::{AssertionInput, VerificationError, VerifiedAssertion, verify_assertion};

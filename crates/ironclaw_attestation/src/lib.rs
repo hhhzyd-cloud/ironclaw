@@ -12,9 +12,10 @@
 //! ## Layering invariant
 //!
 //! This crate depends on `ironclaw_signing_provider`, `serde`/`serde_json`,
-//! `thiserror`, `sha2`, `async-trait`, and — as of PR4 — `webauthn-rs-core`
-//! (COSE key handling + assertion signature verification for the custodial
-//! approval layer). It still carries **no chain SDK** (no `solana-sdk`,
+//! `thiserror`, `sha2`, `async-trait`, and — as of PR4 — the pure-Rust,
+//! openssl-free WebAuthn crypto trio (`coset` for COSE_Key CBOR, `p256` for
+//! ES256, `ed25519-dalek` for EdDSA; NOT `webauthn-rs-core`, which would link
+//! `openssl`). It still carries **no chain SDK** (no `solana-sdk`,
 //! `near-*`, `alloy`), **no EVM crypto primitives** (`k256`/`sha3`), and **no
 //! key custody** (`ironclaw_secrets` / `ironclaw_chain_signing`) — the custody
 //! keys and per-chain decode/sign/broadcast land in PR6. The architecture
@@ -68,9 +69,10 @@ pub use ledger::{InMemorySigningLedger, LedgerError, SigningLedger, SigningLedge
 pub use rendered::{RenderedField, RenderedTx, render};
 pub use webauthn::{
     Aaguid, AssertionInput, AttestationPolicy, BackupFlagPolicy, BootstrapPolicy, CoseError,
-    CosePublicKey, InMemoryWebAuthnCredentialRegistry, OriginPolicy, RegisteredCredential,
-    RegistrationError, RegistrationRequest, SignCountPolicy, VerificationError, VerifiedAssertion,
-    WebAuthnCredentialRegistry, verify_assertion,
+    CosePublicKey, InMemoryWebAuthnCredentialRegistry, OriginContext, OriginPolicy,
+    RegisteredCredential, RegistrationError, RegistrationRequest, SignCountPolicy,
+    StandardOriginPolicy, VerificationError, VerifiedAssertion, WebAuthnCredentialRegistry,
+    verify_assertion,
 };
 
 // Re-export the binding hash type so downstream PRs import it from the

@@ -112,6 +112,17 @@ pub enum RegistrationError {
         reason: String,
     },
 
+    /// An atomic sign-count advance was rejected because the new count did not
+    /// strictly exceed the stored count (and was not the zero-counter no-op):
+    /// possible cloned authenticator or a stale concurrent update.
+    #[error("sign count regression: asserted {asserted} <= stored {stored}")]
+    SignCountRegression {
+        /// The count currently persisted for the credential.
+        stored: u32,
+        /// The non-advancing count that was rejected.
+        asserted: u32,
+    },
+
     /// A backend-internal failure.
     #[error("registry error: {reason}")]
     Backend {
@@ -150,12 +161,95 @@ pub trait BootstrapPolicy: Send + Sync {
     ) -> Result<(), String>;
 }
 
+/// The origin context extracted from `clientDataJSON`, handed to an
+/// [`OriginPolicy`] so it can see the cross-origin bit (not just the origins).
+///
+/// `cross_origin` reflects `clientDataJSON.crossOrigin` (absent ⇒ `false` per
+/// the WebAuthn serialization rules). A cross-origin assertion (an embedded
+/// iframe whose top-level document differs from the RP) is a distinct security
+/// posture: the default policy MUST reject it unless the RP explicitly opts in,
+/// and a `cross_origin: true` claim requires a `top_origin` to be meaningful.
+#[derive(Clone, Copy, Debug)]
+pub struct OriginContext<'a> {
+    /// The RP id this verification is scoped to.
+    pub rp_id: &'a str,
+    /// `clientDataJSON.origin` — the origin of the document that called WebAuthn.
+    pub origin: &'a str,
+    /// `clientDataJSON.topOrigin` — the top-level document's origin, present
+    /// (per spec) only when `cross_origin` is `true`.
+    pub top_origin: Option<&'a str>,
+    /// `clientDataJSON.crossOrigin` (absent ⇒ `false`).
+    pub cross_origin: bool,
+}
+
 /// Injectable origin policy used by the verifier (lives here so registry and
 /// verifier share one policy vocabulary). Fail-closed: return `Err` to reject.
 pub trait OriginPolicy: Send + Sync {
-    /// Decide whether the presented `origin` (and optional `top_origin`) are
-    /// acceptable for the given RP id.
-    fn evaluate(&self, rp_id: &str, origin: &str, top_origin: Option<&str>) -> Result<(), String>;
+    /// Decide whether the presented origin context is acceptable.
+    ///
+    /// Implementations MUST consult [`OriginContext::cross_origin`]: a
+    /// cross-origin assertion is rejected by default and only permitted when the
+    /// RP explicitly allows it *and* a valid [`OriginContext::top_origin`] is
+    /// present. The default [`StandardOriginPolicy`] enforces exactly this.
+    fn evaluate(&self, ctx: &OriginContext<'_>) -> Result<(), String>;
+}
+
+/// Default [`OriginPolicy`]: accept an exact `origin` match for `rp_id`, reject
+/// cross-origin assertions unless explicitly allowed.
+///
+/// Constructed with the exact expected origin (derived by the verifier from the
+/// consumed challenge preimage). When `allow_cross_origin` is `false` (the safe
+/// default), any `crossOrigin: true` assertion is rejected. When `true`, a
+/// cross-origin assertion is permitted ONLY if a `top_origin` is present and
+/// equals the expected origin (the RP must be the top-level document).
+#[derive(Clone, Debug)]
+pub struct StandardOriginPolicy {
+    expected_origin: String,
+    allow_cross_origin: bool,
+}
+
+impl StandardOriginPolicy {
+    /// Reject cross-origin assertions (the safe default).
+    pub fn same_origin_only(expected_origin: impl Into<String>) -> Self {
+        Self {
+            expected_origin: expected_origin.into(),
+            allow_cross_origin: false,
+        }
+    }
+
+    /// Allow a cross-origin assertion only when `topOrigin` equals the expected
+    /// origin (RP is the top-level document).
+    pub fn allow_cross_origin_with_top(expected_origin: impl Into<String>) -> Self {
+        Self {
+            expected_origin: expected_origin.into(),
+            allow_cross_origin: true,
+        }
+    }
+}
+
+impl OriginPolicy for StandardOriginPolicy {
+    fn evaluate(&self, ctx: &OriginContext<'_>) -> Result<(), String> {
+        if ctx.origin != self.expected_origin {
+            return Err(format!("disallowed origin {}", ctx.origin));
+        }
+        if ctx.cross_origin {
+            if !self.allow_cross_origin {
+                return Err("cross-origin assertion not permitted".to_string());
+            }
+            match ctx.top_origin {
+                None => {
+                    return Err("cross-origin assertion missing topOrigin".to_string());
+                }
+                Some(top) if top != self.expected_origin => {
+                    return Err(format!(
+                        "cross-origin topOrigin {top} is not the expected origin"
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Injectable sign-count policy: decide how to treat the relationship between
@@ -182,8 +276,22 @@ pub trait WebAuthnCredentialRegistry: Send + Sync {
     /// if no such credential is registered for that user.
     fn lookup(&self, user: &UserId, credential_id: &CredentialId) -> Option<RegisteredCredential>;
 
-    /// Persist an updated sign count for a credential (called by the call site
-    /// after a successful assertion). Fails closed if the credential is gone.
+    /// Atomically compare-and-advance the stored sign count for a credential
+    /// (called by the call site after a successful assertion).
+    ///
+    /// This is NOT a blind overwrite: the read of the current count, the
+    /// monotonicity check, and the store happen in a single critical section at
+    /// the storage boundary, so two assertions that verified concurrently
+    /// against the same stored count cannot both advance it and a later update
+    /// can never regress the stored value.
+    ///
+    /// Zero-counter policy (WebAuthn §6.1.1): an authenticator that does not
+    /// implement a signature counter always reports `0`. When the stored count
+    /// is `0` and `new_count` is `0`, the update is a no-op success (the
+    /// counter is simply unused). Otherwise `new_count` MUST be strictly
+    /// greater than the stored count; a non-increasing non-zero update is
+    /// rejected with [`RegistrationError::SignCountRegression`] (possible cloned
+    /// authenticator). Fails closed if the credential is gone.
     fn update_sign_count(
         &self,
         user: &UserId,
@@ -294,6 +402,20 @@ impl WebAuthnCredentialRegistry for InMemoryWebAuthnCredentialRegistry {
             })?;
         match map.get_mut(credential_id) {
             Some(cred) if &cred.user == user => {
+                // Atomic compare-and-advance inside the single locked section:
+                // the read of `cred.sign_count`, the monotonicity check, and the
+                // store cannot be interleaved by a concurrent update.
+                let stored = cred.sign_count;
+                let advances = new_count > stored
+                    // Zero-counter authenticators report 0 forever; treat a
+                    // 0 -> 0 update as an accepted no-op.
+                    || (stored == 0 && new_count == 0);
+                if !advances {
+                    return Err(RegistrationError::SignCountRegression {
+                        stored,
+                        asserted: new_count,
+                    });
+                }
                 cred.sign_count = new_count;
                 Ok(())
             }
@@ -428,6 +550,102 @@ mod tests {
             reg.register(request_for("alice", b"c")),
             Err(RegistrationError::BackupFlagRejected { .. })
         ));
+    }
+
+    #[test]
+    fn update_sign_count_advances_monotonically() {
+        let reg = permissive_registry();
+        reg.register(request_for("alice", b"c")).expect("register");
+        let user = UserId::new("alice");
+        let cid = CredentialId::new(b"c".to_vec());
+        // 0 -> 5 advances.
+        reg.update_sign_count(&user, &cid, 5).expect("advance to 5");
+        assert_eq!(reg.lookup(&user, &cid).expect("lookup").sign_count, 5);
+        // 5 -> 6 advances.
+        reg.update_sign_count(&user, &cid, 6).expect("advance to 6");
+        assert_eq!(reg.lookup(&user, &cid).expect("lookup").sign_count, 6);
+    }
+
+    #[test]
+    fn update_sign_count_regression_rejected_and_stored_unchanged() {
+        let reg = permissive_registry();
+        reg.register(request_for("alice", b"c")).expect("register");
+        let user = UserId::new("alice");
+        let cid = CredentialId::new(b"c".to_vec());
+        reg.update_sign_count(&user, &cid, 10)
+            .expect("advance to 10");
+        // 10 -> 4 is a regression: rejected, stored value must NOT change.
+        assert_eq!(
+            reg.update_sign_count(&user, &cid, 4),
+            Err(RegistrationError::SignCountRegression {
+                stored: 10,
+                asserted: 4,
+            })
+        );
+        assert_eq!(reg.lookup(&user, &cid).expect("lookup").sign_count, 10);
+    }
+
+    #[test]
+    fn update_sign_count_equal_nonzero_rejected() {
+        let reg = permissive_registry();
+        reg.register(request_for("alice", b"c")).expect("register");
+        let user = UserId::new("alice");
+        let cid = CredentialId::new(b"c".to_vec());
+        reg.update_sign_count(&user, &cid, 7).expect("advance to 7");
+        // Equal non-zero is non-increasing -> rejected (no overwrite).
+        assert!(matches!(
+            reg.update_sign_count(&user, &cid, 7),
+            Err(RegistrationError::SignCountRegression { .. })
+        ));
+        assert_eq!(reg.lookup(&user, &cid).expect("lookup").sign_count, 7);
+    }
+
+    #[test]
+    fn update_sign_count_zero_to_zero_is_noop_success() {
+        // Zero-counter authenticator: stored 0, asserted 0 is an accepted no-op.
+        let reg = permissive_registry();
+        reg.register(request_for("alice", b"c")).expect("register");
+        let user = UserId::new("alice");
+        let cid = CredentialId::new(b"c".to_vec());
+        reg.update_sign_count(&user, &cid, 0).expect("0 -> 0 no-op");
+        assert_eq!(reg.lookup(&user, &cid).expect("lookup").sign_count, 0);
+    }
+
+    #[test]
+    fn concurrent_updates_advance_count_exactly_once() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // Stored count 5. 32 threads all attempt to advance to 6 (as two
+        // assertions that both verified against the same stored count would).
+        // The atomic compare-and-advance must let exactly ONE win; every other
+        // update must be rejected as a regression (5 was already advanced to 6).
+        let reg = Arc::new(permissive_registry());
+        reg.register(request_for("alice", b"c")).expect("register");
+        let user = UserId::new("alice");
+        let cid = CredentialId::new(b"c".to_vec());
+        reg.update_sign_count(&user, &cid, 5).expect("seed to 5");
+
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let reg = Arc::clone(&reg);
+            let user = user.clone();
+            let cid = cid.clone();
+            handles.push(thread::spawn(move || reg.update_sign_count(&user, &cid, 6)));
+        }
+
+        let mut ok = 0usize;
+        let mut rejected = 0usize;
+        for h in handles {
+            match h.join().expect("thread join") {
+                Ok(()) => ok += 1,
+                Err(RegistrationError::SignCountRegression { .. }) => rejected += 1,
+                Err(other) => panic!("unexpected error under contention: {other:?}"),
+            }
+        }
+        assert_eq!(ok, 1, "exactly one update must advance the count");
+        assert_eq!(rejected, 31, "all stale updates must be rejected");
+        assert_eq!(reg.lookup(&user, &cid).expect("lookup").sign_count, 6);
     }
 
     #[test]

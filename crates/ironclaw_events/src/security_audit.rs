@@ -341,6 +341,32 @@ where
     }
 }
 
+/// Fail-closed pre-action checkpoint.
+///
+/// This is the single production entry point a high-value, irreversible
+/// action (custody-key use, transaction broadcast) MUST funnel through before
+/// proceeding. It durably records `event` via `audit` and returns `Ok(())`
+/// **only** if the record succeeded. On any [`DurableAuditError`] it returns
+/// `Err` and the caller MUST NOT perform the protected action — an un-audited
+/// custody-key use or broadcast is forbidden ("we could not write the audit
+/// record" ⇒ "do not perform the action").
+///
+/// The record happens *before* the action by construction: the action is only
+/// reachable on the `Ok` path. Callers therefore cannot accidentally swallow a
+/// failed audit and proceed anyway.
+///
+/// durable adapter: the real PG/libSQL-backed [`DurableSecurityAudit`]
+/// implementation that this checkpoint awaits in production is delivered by the
+/// attested-signing durable-store track (separate PR). Until then, wire a
+/// production-durable adapter here; the in-memory impl below is test-only and
+/// does NOT satisfy the durable contract for production use.
+pub async fn checkpoint_or_refuse<A: DurableSecurityAudit + ?Sized>(
+    audit: &A,
+    event: SecurityAuditEvent,
+) -> Result<(), DurableAuditError> {
+    audit.record(event).await
+}
+
 /// Test-only durable audit that captures every successfully-recorded event in
 /// memory. Not production-durable (volatile, unbounded). Use the `fail_after`
 /// constructor to simulate a backend that starts failing, exercising the
@@ -524,15 +550,13 @@ mod tests {
         assert_eq!(sink.len(), 1);
     }
 
-    /// Stub pre-sign checkpoint that performs the protected action ONLY if the
-    /// durable audit record succeeds. Mirrors the real call-site contract: the
-    /// audit is awaited and the action fails closed on `Err`.
-    async fn pre_sign_checkpoint<A: DurableSecurityAudit>(
+    /// Drive the *production* [`checkpoint_or_refuse`] and perform the protected
+    /// action ONLY on its `Ok` path — exactly the real call-site contract.
+    async fn guarded_action<A: DurableSecurityAudit>(
         audit: &A,
         event: SecurityAuditEvent,
     ) -> Result<&'static str, DurableAuditError> {
-        // Audit FIRST; only proceed if it durably recorded.
-        audit.record(event).await?;
+        checkpoint_or_refuse(audit, event).await?;
         Ok("signed")
     }
 
@@ -544,22 +568,22 @@ mod tests {
             SecurityDecision::Allowed,
             "custody_key_use",
         );
-        let outcome = pre_sign_checkpoint(&audit, event).await;
+        let outcome = guarded_action(&audit, event).await;
         assert_eq!(outcome.expect("audit ok must allow action"), "signed");
         assert_eq!(audit.len(), 1);
     }
 
     #[tokio::test]
     async fn durable_audit_err_blocks_protected_action() {
-        // Backend fails on the very first record -> the protected action must
-        // not run (fail-closed).
+        // Backend fails on the very first record -> checkpoint_or_refuse returns
+        // Err and the protected action must not run (fail-closed).
         let audit = InMemoryDurableSecurityAudit::fail_after(0);
         let event = SecurityAuditEvent::new(
             SecurityBoundary::BroadcastSubmit,
             SecurityDecision::Allowed,
             "broadcast_submit",
         );
-        let outcome = pre_sign_checkpoint(&audit, event).await;
+        let outcome = guarded_action(&audit, event).await;
         assert!(
             matches!(outcome, Err(DurableAuditError::Backend { .. })),
             "a failed durable audit must block the protected action"
@@ -568,6 +592,27 @@ mod tests {
             audit.is_empty(),
             "no event recorded and (critically) no action performed"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_or_refuse_returns_err_on_audit_failure() {
+        // Direct test of the production checkpoint API: a failing backend makes
+        // the checkpoint itself refuse (the gate, not just a downstream caller).
+        let audit = InMemoryDurableSecurityAudit::fail_after(0);
+        let res = checkpoint_or_refuse(
+            &audit,
+            SecurityAuditEvent::new(
+                SecurityBoundary::CustodyKeyAccess,
+                SecurityDecision::Allowed,
+                "custody_key_use",
+            ),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(DurableAuditError::Backend { .. })),
+            "checkpoint must refuse when the durable audit write fails"
+        );
+        assert!(audit.is_empty());
     }
 
     #[tokio::test]

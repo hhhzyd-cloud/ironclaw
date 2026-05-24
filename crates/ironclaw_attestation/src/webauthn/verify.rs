@@ -31,11 +31,11 @@
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use ironclaw_signing_provider::UserId;
+use ironclaw_signing_provider::{ApprovedTxHash, GateRef, UserId};
 
 use crate::challenge::{ChallengeCommitment, ConsumedChallenge, CredentialId};
 use crate::webauthn::registry::{
-    OriginPolicy, RegisteredCredential, SignCountPolicy, WebAuthnCredentialRegistry,
+    OriginContext, OriginPolicy, RegisteredCredential, SignCountPolicy, WebAuthnCredentialRegistry,
 };
 
 /// Authenticator-data flag bits (WebAuthn / CTAP2).
@@ -89,6 +89,15 @@ pub struct VerifiedAssertion {
     /// Whether the backup-state bit was set (carried for the call site /
     /// audit).
     pub backup_state: bool,
+    /// The gate this assertion authorized, bound from the consumed challenge
+    /// preimage. Carried out as proof of THIS gate so the gate-resolution step
+    /// (PR5) resolves exactly the gate the user was challenged on — not a
+    /// caller-supplied value.
+    pub gate_ref: GateRef,
+    /// The approved-transaction binding hash from the consumed preimage (PR2).
+    /// Carried out as proof of THIS exact transaction so the signing step signs
+    /// only the bytes the user approved.
+    pub rendered_tx_digest: ApprovedTxHash,
 }
 
 /// Fail-closed verification errors. Each maps to a specific RP check.
@@ -156,6 +165,15 @@ pub enum VerificationError {
     #[error("userHandle does not match expected user")]
     ForeignUserHandle,
 
+    /// A caller-supplied verification input did not match the corresponding
+    /// field bound into the consumed challenge preimage. The assertion context
+    /// is not the one that was authorized — fail closed.
+    #[error("assertion context does not match the consumed challenge preimage: {field}")]
+    PreimageContextMismatch {
+        /// Which bound field mismatched (non-secret field name).
+        field: &'static str,
+    },
+
     /// The signature did not verify against the registered public key.
     #[error("assertion signature verification failed")]
     BadSignature,
@@ -179,12 +197,24 @@ struct CollectedClientData {
     origin: String,
     #[serde(rename = "topOrigin")]
     top_origin: Option<String>,
+    /// `crossOrigin` is OPTIONAL in the serialization; absent ⇒ `false`.
+    #[serde(rename = "crossOrigin", default)]
+    cross_origin: bool,
 }
 
-/// Decode a base64url (no padding) string to bytes, fail-closed.
+/// Strict base64url (no padding) decode to bytes, fail-closed.
+///
+/// Rejects:
+/// - any non-alphabet byte (incl. `=` padding — this is the no-pad form),
+/// - a length ≡ 1 (mod 4), which cannot encode whole bytes,
+/// - non-canonical trailing bits (the leftover `nbits` after the last full
+///   byte MUST be zero, so each input has exactly one canonical encoding).
 fn b64url_decode(s: &str) -> Result<Vec<u8>, VerificationError> {
-    // Hand-rolled base64url-nopad decode (no new dependency; < 30 lines). The
-    // challenge is a 32-byte commitment, so input is small and fixed-shape.
+    fn malformed(reason: &str) -> VerificationError {
+        VerificationError::MalformedClientData {
+            reason: reason.to_string(),
+        }
+    }
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
@@ -196,19 +226,27 @@ fn b64url_decode(s: &str) -> Result<Vec<u8>, VerificationError> {
         }
     }
     let bytes = s.as_bytes();
+    // A base64 group is 4 chars -> 3 bytes; a trailing group of length 1 is
+    // impossible (it would carry only 6 bits, less than one byte).
+    if bytes.len() % 4 == 1 {
+        return Err(malformed("invalid base64url length in challenge"));
+    }
     let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
     let mut acc: u32 = 0;
     let mut nbits = 0u32;
     for &c in bytes {
-        let v = val(c).ok_or_else(|| VerificationError::MalformedClientData {
-            reason: "invalid base64url in challenge".to_string(),
-        })? as u32;
+        let v = val(c).ok_or_else(|| malformed("invalid base64url in challenge"))? as u32;
         acc = (acc << 6) | v;
         nbits += 6;
         if nbits >= 8 {
             nbits -= 8;
             out.push((acc >> nbits) as u8);
         }
+    }
+    // Canonical-encoding check: any leftover bits beyond the last whole byte
+    // MUST be zero, otherwise this is a non-canonical (malleable) encoding.
+    if nbits > 0 && (acc & ((1 << nbits) - 1)) != 0 {
+        return Err(malformed("non-canonical trailing bits in challenge"));
     }
     Ok(out)
 }
@@ -235,9 +273,32 @@ pub fn verify_assertion(
     sign_count_policy: &dyn SignCountPolicy,
     input: &AssertionInput<'_>,
 ) -> Result<VerifiedAssertion, VerificationError> {
+    // 0. Bind the assertion context to the consumed challenge preimage.
+    //
+    // The preimage (produced when WE issued the challenge) is the source of
+    // truth for WHO is authenticating, WHICH credential answers, the RP id, and
+    // the expected origin. The caller-supplied verification inputs are only
+    // *claims*; every one must equal the corresponding bound field or we fail
+    // closed BEFORE doing any signature work. This prevents a caller from
+    // verifying an assertion against a gate/tx other than the one the user was
+    // actually challenged on. `gate_ref` and `rendered_tx_digest` are then
+    // carried into the success output as proof of THIS gate/tx.
+    let preimage = &input.consumed_challenge.preimage;
+    if input.expected_user != &preimage.user {
+        return Err(VerificationError::PreimageContextMismatch { field: "user" });
+    }
+    if input.credential_id != &preimage.credential_id {
+        return Err(VerificationError::PreimageContextMismatch {
+            field: "credential_id",
+        });
+    }
+    if input.rp_id != preimage.rp_id {
+        return Err(VerificationError::PreimageContextMismatch { field: "rp_id" });
+    }
+
     // 1. Credential must be registered for the expected user.
     let credential: RegisteredCredential = registry
-        .lookup(input.expected_user, input.credential_id)
+        .lookup(&preimage.user, &preimage.credential_id)
         .ok_or(VerificationError::UnknownCredential)?;
 
     // userHandle ownership binding: when the authenticator returns a userHandle
@@ -267,13 +328,21 @@ pub fn verify_assertion(
         return Err(VerificationError::ChallengeMismatch);
     }
 
-    // 4. Origin / topOrigin policy.
+    // 4. Origin binding + policy. The asserted origin must equal the origin
+    //    bound into the preimage (the origin the challenge was issued for); a
+    //    different origin is a preimage-context mismatch, failing closed before
+    //    the injectable policy even runs. The policy then additionally vets the
+    //    cross-origin posture (topOrigin / crossOrigin).
+    if client_data.origin != preimage.expected_origin {
+        return Err(VerificationError::PreimageContextMismatch { field: "origin" });
+    }
     origin_policy
-        .evaluate(
-            input.rp_id,
-            &client_data.origin,
-            client_data.top_origin.as_deref(),
-        )
+        .evaluate(&OriginContext {
+            rp_id: input.rp_id,
+            origin: &client_data.origin,
+            top_origin: client_data.top_origin.as_deref(),
+            cross_origin: client_data.cross_origin,
+        })
         .map_err(|reason| VerificationError::OriginRejected { reason })?;
 
     // 5-7. Parse authenticatorData header and validate rpIdHash + flags.
@@ -345,6 +414,10 @@ pub fn verify_assertion(
         credential_id: credential.credential_id,
         new_sign_count: asserted_sign_count,
         backup_state: bs,
+        // Carry the bound gate/tx out of the verifier as proof of exactly which
+        // gate + transaction THIS assertion authorized.
+        gate_ref: preimage.gate_ref.clone(),
+        rendered_tx_digest: preimage.rendered_tx_digest,
     })
 }
 
@@ -401,7 +474,8 @@ pub(crate) mod test_authenticator {
             data
         }
 
-        /// Build a `clientDataJSON` echoing `challenge` for the given origin.
+        /// Build a `clientDataJSON` echoing `challenge` for the given origin
+        /// (same-origin: `crossOrigin:false`, no `topOrigin`).
         pub(crate) fn client_data_json(
             type_: &str,
             challenge: &ChallengeCommitment,
@@ -412,6 +486,38 @@ pub(crate) mod test_authenticator {
                 r#"{{"type":"{type_}","challenge":"{chal_b64}","origin":"{origin}","crossOrigin":false}}"#
             )
             .into_bytes()
+        }
+
+        /// Build a `clientDataJSON` with an explicit `crossOrigin` flag and an
+        /// optional `topOrigin`, for cross-origin policy tests.
+        pub(crate) fn client_data_json_cross(
+            type_: &str,
+            challenge: &ChallengeCommitment,
+            origin: &str,
+            cross_origin: bool,
+            top_origin: Option<&str>,
+        ) -> Vec<u8> {
+            let chal_b64 = b64url_encode(challenge.as_bytes());
+            let top = match top_origin {
+                Some(t) => format!(r#","topOrigin":"{t}""#),
+                None => String::new(),
+            };
+            format!(
+                r#"{{"type":"{type_}","challenge":"{chal_b64}","origin":"{origin}","crossOrigin":{cross_origin}{top}}}"#
+            )
+            .into_bytes()
+        }
+
+        /// Build a `clientDataJSON` with NO `crossOrigin` key at all (it is
+        /// OPTIONAL; absent must be treated as `false`).
+        pub(crate) fn client_data_json_no_cross_key(
+            type_: &str,
+            challenge: &ChallengeCommitment,
+            origin: &str,
+        ) -> Vec<u8> {
+            let chal_b64 = b64url_encode(challenge.as_bytes());
+            format!(r#"{{"type":"{type_}","challenge":"{chal_b64}","origin":"{origin}"}}"#)
+                .into_bytes()
         }
 
         /// Sign `authenticatorData ∥ SHA-256(clientDataJSON)`. ES256 returns a
@@ -464,7 +570,7 @@ mod tests {
     use crate::challenge::{ChallengePreimage, CredentialId, DeliveryAttemptId};
     use crate::webauthn::registry::{
         AttestationPolicy, BackupFlagPolicy, BootstrapPolicy, InMemoryWebAuthnCredentialRegistry,
-        RegistrationRequest,
+        RegistrationRequest, StandardOriginPolicy,
     };
     use ironclaw_signing_provider::{
         ActorId, ApprovedTxHash, ChainId, GateRef, KeyOrAccountId, RunId, ScopeId, TenantId, UserId,
@@ -491,15 +597,18 @@ mod tests {
         }
     }
 
-    /// Origin policy that only accepts the exact expected origin.
+    /// Origin policy that only accepts the exact expected origin and rejects
+    /// cross-origin assertions (the safe default posture).
     struct ExactOrigin;
     impl OriginPolicy for ExactOrigin {
-        fn evaluate(&self, _rp: &str, origin: &str, _top: Option<&str>) -> Result<(), String> {
-            if origin == ORIGIN {
-                Ok(())
-            } else {
-                Err(format!("disallowed origin {origin}"))
+        fn evaluate(&self, ctx: &OriginContext<'_>) -> Result<(), String> {
+            if ctx.origin != ORIGIN {
+                return Err(format!("disallowed origin {}", ctx.origin));
             }
+            if ctx.cross_origin {
+                return Err("cross-origin not permitted".to_string());
+            }
+            Ok(())
         }
     }
 
@@ -790,7 +899,10 @@ mod tests {
     }
 
     #[test]
-    fn disallowed_origin_rejected() {
+    fn disallowed_origin_rejected_as_preimage_mismatch() {
+        // The asserted origin differs from the origin bound in the preimage:
+        // this now fails closed as a preimage-context mismatch (before the
+        // injectable policy even runs).
         let fx = fixture(0, false);
         let pre = preimage(1);
         let commit = pre.commitment();
@@ -805,7 +917,323 @@ mod tests {
             None,
             false,
         );
+        assert_eq!(
+            res,
+            Err(VerificationError::PreimageContextMismatch { field: "origin" })
+        );
+    }
+
+    #[test]
+    fn origin_policy_rejection_surfaces_as_origin_rejected() {
+        // Origin matches the preimage, but an injectable policy that rejects the
+        // posture (here: a cross-origin assertion under the same-origin-only
+        // ExactOrigin) surfaces as OriginRejected — the policy path is live.
+        let fx = fixture(0, false);
+        let pre = preimage(1);
+        let commit = pre.commitment();
+        let ad = SoftwareAuthenticator::authenticator_data(RP_ID, UP_UV, 1);
+        let cdj = SoftwareAuthenticator::client_data_json_cross(
+            "webauthn.get",
+            &commit,
+            ORIGIN,
+            true,
+            Some(ORIGIN),
+        );
+        let sig = fx.auth.sign(&ad, &cdj);
+        let cons = consumed(pre.clone());
+        let input = AssertionInput {
+            expected_user: &UserId::new("alice"),
+            user_handle: None,
+            credential_id: &CredentialId::new(b"cred-1".to_vec()),
+            authenticator_data: &ad,
+            client_data_json: &cdj,
+            signature: &sig,
+            rp_id: RP_ID,
+            consumed_challenge: &cons,
+            expected_user_handle: USER_HANDLE,
+        };
+        assert!(matches!(
+            verify_assertion(&fx.registry, &ExactOrigin, &StrictlyIncreasing, &input),
+            Err(VerificationError::OriginRejected { .. })
+        ));
+    }
+
+    /// Drive the verifier with a fully custom clientDataJSON (for crossOrigin /
+    /// preimage-context tests), using `policy` as the origin policy.
+    #[allow(clippy::too_many_arguments)]
+    fn run_with(
+        fx: &Fixture,
+        pre: &ChallengePreimage,
+        policy: &dyn OriginPolicy,
+        expected_user: &UserId,
+        credential_id: &CredentialId,
+        rp_id: &str,
+        cdj: &[u8],
+    ) -> Result<VerifiedAssertion, VerificationError> {
+        let ad = SoftwareAuthenticator::authenticator_data(RP_ID, UP_UV, 1);
+        let sig = fx.auth.sign(&ad, cdj);
+        let cons = consumed(pre.clone());
+        let input = AssertionInput {
+            expected_user,
+            user_handle: None,
+            credential_id,
+            authenticator_data: &ad,
+            client_data_json: cdj,
+            signature: &sig,
+            rp_id,
+            consumed_challenge: &cons,
+            expected_user_handle: USER_HANDLE,
+        };
+        verify_assertion(&fx.registry, policy, &StrictlyIncreasing, &input)
+    }
+
+    #[test]
+    fn cross_origin_true_rejected_by_default() {
+        let fx = fixture(0, false);
+        let pre = preimage(1);
+        let commit = pre.commitment();
+        let cdj = SoftwareAuthenticator::client_data_json_cross(
+            "webauthn.get",
+            &commit,
+            ORIGIN,
+            true,
+            Some(ORIGIN),
+        );
+        let policy = StandardOriginPolicy::same_origin_only(ORIGIN);
+        let res = run_with(
+            &fx,
+            &pre,
+            &policy,
+            &UserId::new("alice"),
+            &CredentialId::new(b"cred-1".to_vec()),
+            RP_ID,
+            &cdj,
+        );
         assert!(matches!(res, Err(VerificationError::OriginRejected { .. })));
+    }
+
+    #[test]
+    fn cross_origin_true_missing_top_origin_rejected() {
+        let fx = fixture(0, false);
+        let pre = preimage(1);
+        let commit = pre.commitment();
+        // crossOrigin:true but NO topOrigin -> rejected even when cross-origin
+        // is allowed.
+        let cdj = SoftwareAuthenticator::client_data_json_cross(
+            "webauthn.get",
+            &commit,
+            ORIGIN,
+            true,
+            None,
+        );
+        let policy = StandardOriginPolicy::allow_cross_origin_with_top(ORIGIN);
+        let res = run_with(
+            &fx,
+            &pre,
+            &policy,
+            &UserId::new("alice"),
+            &CredentialId::new(b"cred-1".to_vec()),
+            RP_ID,
+            &cdj,
+        );
+        assert!(matches!(res, Err(VerificationError::OriginRejected { .. })));
+    }
+
+    #[test]
+    fn cross_origin_true_inconsistent_top_origin_rejected() {
+        let fx = fixture(0, false);
+        let pre = preimage(1);
+        let commit = pre.commitment();
+        // crossOrigin:true with a topOrigin that is NOT the expected origin.
+        let cdj = SoftwareAuthenticator::client_data_json_cross(
+            "webauthn.get",
+            &commit,
+            ORIGIN,
+            true,
+            Some("https://evil.example"),
+        );
+        let policy = StandardOriginPolicy::allow_cross_origin_with_top(ORIGIN);
+        let res = run_with(
+            &fx,
+            &pre,
+            &policy,
+            &UserId::new("alice"),
+            &CredentialId::new(b"cred-1".to_vec()),
+            RP_ID,
+            &cdj,
+        );
+        assert!(matches!(res, Err(VerificationError::OriginRejected { .. })));
+    }
+
+    #[test]
+    fn cross_origin_true_with_matching_top_origin_accepted_when_allowed() {
+        let fx = fixture(0, false);
+        let pre = preimage(1);
+        let commit = pre.commitment();
+        let cdj = SoftwareAuthenticator::client_data_json_cross(
+            "webauthn.get",
+            &commit,
+            ORIGIN,
+            true,
+            Some(ORIGIN),
+        );
+        let policy = StandardOriginPolicy::allow_cross_origin_with_top(ORIGIN);
+        let out = run_with(
+            &fx,
+            &pre,
+            &policy,
+            &UserId::new("alice"),
+            &CredentialId::new(b"cred-1".to_vec()),
+            RP_ID,
+            &cdj,
+        )
+        .expect("cross-origin with matching topOrigin must verify when allowed");
+        assert_eq!(out.user, UserId::new("alice"));
+    }
+
+    #[test]
+    fn missing_cross_origin_key_treated_as_false() {
+        // No crossOrigin key at all -> defaults to false -> accepted by the
+        // same-origin-only policy.
+        let fx = fixture(0, false);
+        let pre = preimage(1);
+        let commit = pre.commitment();
+        let cdj =
+            SoftwareAuthenticator::client_data_json_no_cross_key("webauthn.get", &commit, ORIGIN);
+        let policy = StandardOriginPolicy::same_origin_only(ORIGIN);
+        let out = run_with(
+            &fx,
+            &pre,
+            &policy,
+            &UserId::new("alice"),
+            &CredentialId::new(b"cred-1".to_vec()),
+            RP_ID,
+            &cdj,
+        )
+        .expect("absent crossOrigin must be treated as false and accepted");
+        assert_eq!(out.new_sign_count, 1);
+    }
+
+    #[test]
+    fn preimage_user_mismatch_fails_closed() {
+        let fx = fixture(0, false);
+        let pre = preimage(1);
+        let commit = pre.commitment();
+        let cdj = SoftwareAuthenticator::client_data_json("webauthn.get", &commit, ORIGIN);
+        // Caller claims a DIFFERENT user than the one bound in the preimage.
+        let res = run_with(
+            &fx,
+            &pre,
+            &ExactOrigin,
+            &UserId::new("mallory"),
+            &CredentialId::new(b"cred-1".to_vec()),
+            RP_ID,
+            &cdj,
+        );
+        assert_eq!(
+            res,
+            Err(VerificationError::PreimageContextMismatch { field: "user" })
+        );
+    }
+
+    #[test]
+    fn preimage_credential_mismatch_fails_closed() {
+        let fx = fixture(0, false);
+        let pre = preimage(1);
+        let commit = pre.commitment();
+        let cdj = SoftwareAuthenticator::client_data_json("webauthn.get", &commit, ORIGIN);
+        let res = run_with(
+            &fx,
+            &pre,
+            &ExactOrigin,
+            &UserId::new("alice"),
+            &CredentialId::new(b"other-cred".to_vec()),
+            RP_ID,
+            &cdj,
+        );
+        assert_eq!(
+            res,
+            Err(VerificationError::PreimageContextMismatch {
+                field: "credential_id"
+            })
+        );
+    }
+
+    #[test]
+    fn preimage_rp_id_mismatch_fails_closed() {
+        let fx = fixture(0, false);
+        let pre = preimage(1);
+        let commit = pre.commitment();
+        let cdj = SoftwareAuthenticator::client_data_json("webauthn.get", &commit, ORIGIN);
+        let res = run_with(
+            &fx,
+            &pre,
+            &ExactOrigin,
+            &UserId::new("alice"),
+            &CredentialId::new(b"cred-1".to_vec()),
+            "other.rp",
+            &cdj,
+        );
+        assert_eq!(
+            res,
+            Err(VerificationError::PreimageContextMismatch { field: "rp_id" })
+        );
+    }
+
+    #[test]
+    fn verified_assertion_carries_gate_and_tx_digest() {
+        // The success output binds the gate_ref + rendered_tx_digest from the
+        // consumed preimage (proof of THIS gate/tx).
+        let fx = fixture(0, false);
+        let pre = preimage(1);
+        let commit = pre.commitment();
+        let out = run(
+            &fx,
+            &pre,
+            UP_UV,
+            1,
+            "webauthn.get",
+            ORIGIN,
+            &commit,
+            None,
+            false,
+        )
+        .expect("valid assertion must verify");
+        assert_eq!(out.gate_ref, pre.gate_ref);
+        assert_eq!(out.rendered_tx_digest, pre.rendered_tx_digest);
+    }
+
+    #[test]
+    fn non_canonical_challenge_trailing_bits_rejected() {
+        // A base64url string whose final char carries non-zero trailing bits is
+        // a non-canonical (malleable) encoding and must be rejected at decode.
+        let fx = fixture(0, false);
+        let pre = preimage(1);
+        let ad = SoftwareAuthenticator::authenticator_data(RP_ID, UP_UV, 1);
+        // 43 base64url chars decode to 32 bytes (the commitment length); the
+        // last char ('B' = value 1) leaves 2 non-zero trailing bits.
+        let bad_challenge = format!("{}B", "A".repeat(42));
+        let cdj = format!(
+            r#"{{"type":"webauthn.get","challenge":"{bad_challenge}","origin":"{ORIGIN}","crossOrigin":false}}"#
+        )
+        .into_bytes();
+        let sig = fx.auth.sign(&ad, &cdj);
+        let cons = consumed(pre.clone());
+        let input = AssertionInput {
+            expected_user: &UserId::new("alice"),
+            user_handle: None,
+            credential_id: &CredentialId::new(b"cred-1".to_vec()),
+            authenticator_data: &ad,
+            client_data_json: &cdj,
+            signature: &sig,
+            rp_id: RP_ID,
+            consumed_challenge: &cons,
+            expected_user_handle: USER_HANDLE,
+        };
+        assert!(matches!(
+            verify_assertion(&fx.registry, &ExactOrigin, &StrictlyIncreasing, &input),
+            Err(VerificationError::MalformedClientData { .. })
+        ));
     }
 
     #[test]
@@ -880,7 +1308,11 @@ mod tests {
     #[test]
     fn unregistered_credential_rejected() {
         let fx = fixture(0, false);
-        let pre = preimage(1);
+        // Bind the challenge to an unregistered credential id so the assertion
+        // context MATCHES the preimage (passing the context-binding step) but
+        // the registry lookup misses -> UnknownCredential.
+        let mut pre = preimage(1);
+        pre.credential_id = CredentialId::new(b"not-registered".to_vec());
         let commit = pre.commitment();
         let ad = SoftwareAuthenticator::authenticator_data(RP_ID, UP_UV, 1);
         let cdj = SoftwareAuthenticator::client_data_json("webauthn.get", &commit, ORIGIN);
