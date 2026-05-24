@@ -390,11 +390,11 @@ async fn resolve_gate_attested_without_continuation_port_fails_closed() {
     );
 }
 
-/// A continuation port wrapper that counts how many times the continuation
-/// (`continue_resolved_gate`) is actually driven, and how many times the
-/// preflight (`verify_resolution`) runs, delegating both to the real composition
+/// A continuation port wrapper that counts how many times the full verify+claim
+/// (`verify_and_claim`) runs and how many times the broadcast half
+/// (`broadcast_resolved`) is driven, delegating both to the real composition
 /// port. Lets the tests assert the verify-before-resume ordering and the
-/// drive-exactly-once invariant.
+/// single-drive invariant (PR11 item B).
 struct CountingContinuation {
     inner: RebornAttestedContinuation,
     verify_calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -403,31 +403,34 @@ struct CountingContinuation {
 
 #[async_trait::async_trait]
 impl AttestedGateContinuationPort for CountingContinuation {
-    async fn verify_resolution(
+    async fn verify_and_claim(
         &self,
         scope: &TurnScope,
         run_id: TurnRunId,
         gate_ref: &GateRef,
         claim: &AttestedProofClaim,
-    ) -> Result<(), AttestedContinuationRejection> {
+    ) -> Result<
+        ironclaw_product_workflow::VerifiedAttestedContinuation,
+        AttestedContinuationRejection,
+    > {
         self.verify_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner
-            .verify_resolution(scope, run_id, gate_ref, claim)
+            .verify_and_claim(scope, run_id, gate_ref, claim)
             .await
     }
 
-    async fn continue_resolved_gate(
+    async fn broadcast_resolved(
         &self,
         scope: &TurnScope,
         run_id: TurnRunId,
         gate_ref: &GateRef,
-        claim: &AttestedProofClaim,
+        verified: ironclaw_product_workflow::VerifiedAttestedContinuation,
     ) -> Result<AttestedContinuationOutcome, AttestedContinuationRejection> {
         self.drive_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner
-            .continue_resolved_gate(scope, run_id, gate_ref, claim)
+            .broadcast_resolved(scope, run_id, gate_ref, verified)
             .await
     }
 }
@@ -494,42 +497,59 @@ async fn wired_services_with_counting(
     )
 }
 
-/// A same-`client_action_id` retry replays the cached `resume_turn` success but
-/// must NOT double-drive the continuation (no double sign/broadcast).
+/// A same-key retry is single-drive via the grant/ledger CAS: the first resolve
+/// claims the grant + broadcasts once; the retry's `verify_and_claim` re-enters
+/// the driver, the one-shot ledger CAS rejects the second claim (clean replay
+/// error), and the broadcast half is never reached again — no double
+/// sign/broadcast.
 #[tokio::test]
-async fn resolve_gate_attested_retry_drives_continuation_once() {
-    let (services, store, hash_ref, key, hash, account_hex, _verify, drive) =
+async fn resolve_gate_attested_retry_is_single_drive_via_grant_cas() {
+    let (services, store, hash_ref, key, hash, account_hex, verify, drive) =
         wired_services_with_counting(0x44).await;
     let run_id = block_attested(&store, &hash_ref).await;
 
     let req = || attested_request(run_id, &key, &hash, &account_hex, "action-retry");
 
-    // First (fresh) resolve drives the continuation once.
+    // First (fresh) resolve: verify+claim runs once, broadcast drives once.
     services
         .resolve_gate(caller(), req())
         .await
         .expect("fresh attested resolve succeeds");
     assert_eq!(
-        drive.load(std::sync::atomic::Ordering::SeqCst),
+        verify.load(std::sync::atomic::Ordering::SeqCst),
         1,
-        "fresh resolve drives the continuation exactly once"
+        "fresh resolve runs verify+claim exactly once"
     );
-
-    // Retry with the SAME client_action_id replays the cached resume success;
-    // the continuation must NOT fire again.
-    services
-        .resolve_gate(caller(), req())
-        .await
-        .expect("same-client_action_id retry replays cached success");
     assert_eq!(
         drive.load(std::sync::atomic::Ordering::SeqCst),
         1,
-        "retry must NOT double-drive the continuation"
+        "fresh resolve drives the broadcast exactly once"
+    );
+
+    // Retry: verify+claim re-enters the driver, the one-shot grant/ledger CAS
+    // rejects the second claim. The retry fails closed (clean replay error) and
+    // the broadcast half is NOT reached again.
+    let replay = services.resolve_gate(caller(), req()).await;
+    assert!(
+        replay.is_err(),
+        "same-key retry must fail closed via the grant/ledger CAS"
+    );
+    assert_eq!(
+        verify.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "retry re-enters verify+claim (where the CAS rejects it)"
+    );
+    assert_eq!(
+        drive.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "retry must NOT double-drive the broadcast"
     );
 }
 
-/// A malformed proof must be rejected by the non-mutating preflight BEFORE
-/// `resume_turn`, leaving the turn `BlockedAttested` and driving NO continuation.
+/// A malformed proof must be rejected by `verify_and_claim` BEFORE `resume_turn`
+/// (it fails at decode, before any grant claim or ledger advance), leaving the
+/// turn `BlockedAttested` and driving NO broadcast — so a follow-up VALID resolve
+/// still succeeds.
 #[tokio::test]
 async fn resolve_gate_attested_malformed_proof_fails_before_resume() {
     let (services, store, hash_ref, key, hash, account_hex, verify, drive) =
@@ -552,12 +572,12 @@ async fn resolve_gate_attested_malformed_proof_fails_before_resume() {
     assert_eq!(
         verify.load(std::sync::atomic::Ordering::SeqCst),
         1,
-        "preflight verify ran"
+        "verify+claim ran (and failed at decode)"
     );
     assert_eq!(
         drive.load(std::sync::atomic::Ordering::SeqCst),
         0,
-        "continuation must NOT be driven for a malformed proof"
+        "broadcast must NOT be driven for a malformed proof"
     );
 
     // The turn must remain BlockedAttested (no state mutated): a follow-up VALID
@@ -576,6 +596,67 @@ async fn resolve_gate_attested_malformed_proof_fails_before_resume() {
         drive.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "the valid follow-up drives the continuation exactly once"
+    );
+}
+
+/// A FORGED proof (well-formed, but signed by the WRONG key) must be rejected by
+/// the FULL cryptographic verification inside `verify_and_claim` BEFORE
+/// `resume_turn`: the turn stays `BlockedAttested`, no broadcast is driven, and
+/// the sealed grant is NOT consumed — so a follow-up VALID resolve still
+/// succeeds. This is the core item-B guarantee: signature verification gates the
+/// transition.
+#[tokio::test]
+async fn resolve_gate_attested_forged_signature_fails_before_resume() {
+    let (services, store, hash_ref, key, hash, account_hex, verify, drive) =
+        wired_services_with_counting(0x77).await;
+    let run_id = block_attested(&store, &hash_ref).await;
+
+    // Forge: keep the bound signer/account, but sign with a DIFFERENT key so the
+    // recovered signer will not match. The proof is structurally valid (decodes
+    // fine) but cryptographically wrong.
+    let wrong_key = EdSigningKey::from_bytes(&[0x88u8; 32]);
+    let forged_signature = wrong_key.sign(hash.as_bytes());
+    let mut req = attested_request(run_id, &key, &hash, &account_hex, "action-forged");
+    req.attested_proof = Some(json!({
+        "scheme": "solana",
+        "approved_tx_hash": lower_hex(hash.as_bytes()),
+        "claimed_signer": account_hex,
+        "signature": lower_hex(&forged_signature.to_bytes()),
+        "public_key": account_hex,
+    }));
+
+    let result = services.resolve_gate(caller(), req).await;
+    assert!(
+        result.is_err(),
+        "forged signature must fail closed before resume"
+    );
+    assert_eq!(
+        verify.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "verify+claim ran (and the signature check rejected the forgery)"
+    );
+    assert_eq!(
+        drive.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "broadcast must NOT be driven for a forged proof"
+    );
+
+    // The turn stayed BlockedAttested and the grant was NOT consumed: a valid
+    // follow-up still succeeds and drives the broadcast exactly once.
+    let ok = services
+        .resolve_gate(
+            caller(),
+            attested_request(run_id, &key, &hash, &account_hex, "action-good"),
+        )
+        .await;
+    assert!(
+        ok.is_ok(),
+        "turn stayed BlockedAttested + grant unclaimed after forgery: {ok:?}"
+    );
+    assert_eq!(
+        drive.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the valid follow-up drives the broadcast exactly once"
     );
 }
 

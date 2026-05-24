@@ -58,7 +58,7 @@ pub use binding::{
 };
 pub use driver::{
     AttestedSignerContinuationDriver, Broadcaster, ContinuationError, CustodialSignerLike,
-    ProviderRegistry, SignerContinuationOutcome,
+    ProviderRegistry, SignerContinuationOutcome, VerifiedContinuation,
 };
 pub use port::{
     InMemoryResumeGuard, ResumeGuard, RuntimeAttestedResumePort, approved_tx_hash_ref_hex,

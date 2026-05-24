@@ -5,18 +5,23 @@
 //! ([`ironclaw_product_workflow`]) and the attested-signing signer-continuation
 //! driver assembled in [`crate::attested`] over [`ironclaw_attested_runtime`].
 //!
-//! The facade has already driven the turn to `AttestedResolved` (the
-//! synchronous `RuntimeAttestedResumePort` binding re-check + one-shot resume
-//! guard passed). This port runs the heavyweight half:
+//! Atomic verify-before-resume (PR11 item B): this port runs the heavyweight
+//! cryptographic half in two phases, straddling the turn transition.
 //!
-//! 1. Decode the opaque [`AttestedProofClaim`] into the concrete
+//! 1. [`AttestedGateContinuationPort::verify_and_claim`] (BEFORE the turn
+//!    transitions): decode the opaque [`AttestedProofClaim`] into the concrete
 //!    [`ironclaw_signing_provider::SigningProof`] for its proof family (mirrors
-//!    the legacy monolith `proof_from_input` / `near_proof_from_input` /
-//!    WalletConnect decode in `src/channels/web/features/chat/attested.rs`).
-//! 2. Call [`AttestedSignerContinuationDriver::continue_after_resolved`], which
-//!    reads the authoritative binding persisted on gate raise, claims the
-//!    sealed one-shot grant, verifies the proof through the bound provider, and
-//!    performs the ledger-guarded broadcast.
+//!    the legacy monolith decode in
+//!    `src/channels/web/features/chat/attested.rs`), then call
+//!    [`AttestedSignerContinuationDriver::verify_and_sign`], which reads the
+//!    authoritative binding, claims the sealed one-shot grant, and verifies the
+//!    proof through the bound provider. On any failure the turn is left
+//!    `BlockedAttested` (the facade never resumes). On success it returns an
+//!    opaque verified handle.
+//! 2. [`AttestedGateContinuationPort::broadcast_resolved`] (AFTER `resume_turn`
+//!    drove the turn to `AttestedResolved`): consume the verified handle and
+//!    call [`AttestedSignerContinuationDriver::broadcast_signed_continuation`]
+//!    to perform the ledger-guarded broadcast. No re-verification, no re-claim.
 //!
 //! All verification (signer/hash binding, sealed-grant CAS, ledger idempotency)
 //! lives in `ironclaw_attested_runtime` / the providers — this module is decode
@@ -26,12 +31,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use ironclaw_attested_runtime::{
-    AttestedGateBindingStore, ContinuationError, InMemoryAttestedGateBindingStore,
-};
+use ironclaw_attested_runtime::{ContinuationError, VerifiedContinuation};
 use ironclaw_product_workflow::{
     AttestedContinuationOutcome, AttestedContinuationRejection, AttestedGateContinuationPort,
-    AttestedProofClaim, AttestedProofKind,
+    AttestedProofClaim, AttestedProofKind, VerifiedAttestedContinuation,
 };
 use ironclaw_signing_provider::{
     ApprovedTxHash, GateRef as SigningGateRef, SigningProof, SigningProviderError,
@@ -59,10 +62,6 @@ type NoEvmTx = alloy_consensus::TxEip1559;
 /// runtime (the same driver + binding store + ledger the resume port reads).
 pub struct RebornAttestedContinuation {
     driver: Arc<LocalDevContinuationDriver>,
-    /// The authoritative gate-binding store, shared with the driver and the
-    /// resume port. Read (never mutated) by [`Self::verify_resolution`] to
-    /// re-check the proof against the bound hash before `resume_turn`.
-    bindings: Arc<InMemoryAttestedGateBindingStore>,
 }
 
 impl RebornAttestedContinuation {
@@ -70,64 +69,61 @@ impl RebornAttestedContinuation {
     pub fn new(composition: &RebornAttestedComposition) -> Self {
         Self {
             driver: Arc::clone(composition.driver()),
-            bindings: Arc::clone(composition.bindings()),
         }
     }
 }
 
 #[async_trait]
 impl AttestedGateContinuationPort for RebornAttestedContinuation {
-    async fn verify_resolution(
+    async fn verify_and_claim(
         &self,
         _scope: &TurnScope,
         _run_id: TurnRunId,
         gate_ref: &GateRef,
         claim: &AttestedProofClaim,
-    ) -> Result<(), AttestedContinuationRejection> {
-        // Read-only preflight: decode the proof and re-check it against the
-        // authoritative binding persisted at gate-raise. No grant claim, no
-        // ledger advance — a failure here must leave NO state mutated so the
-        // facade can safely refuse the resume.
-        let proof = decode_proof(claim)?;
-        let signing_gate_ref = SigningGateRef::new(gate_ref.as_str());
-        let binding = self
-            .bindings
-            .get(&signing_gate_ref)
-            .await
-            .ok_or(AttestedContinuationRejection::MissingBinding)?;
-
-        // The attested hash must equal the authoritative bound hash (threat #3):
-        // a caller can only attest to the bound hash, never redefine it. The
-        // cryptographic signature/grant check still runs post-resume in the
-        // driver (see the trait doc / coordination note). `decode_proof` above
-        // already validated the proof_json structure (incl. its own embedded
-        // hash); `claim.approved_tx_hash_hex` is the on-the-wire attested hash
-        // (it becomes the resume `AttestationClaimRef`), so binding it here
-        // closes the fail-open window without mutating any state.
-        let _ = &proof;
-        let attested_hash = parse_hash(&claim.approved_tx_hash_hex)?;
-        if attested_hash.as_bytes() != binding.approved_tx_hash.as_bytes() {
-            return Err(AttestedContinuationRejection::ProofRejected);
-        }
-        Ok(())
-    }
-
-    async fn continue_resolved_gate(
-        &self,
-        _scope: &TurnScope,
-        _run_id: TurnRunId,
-        gate_ref: &GateRef,
-        claim: &AttestedProofClaim,
-    ) -> Result<AttestedContinuationOutcome, AttestedContinuationRejection> {
+    ) -> Result<VerifiedAttestedContinuation, AttestedContinuationRejection> {
+        // FULL verification + one-shot grant claim, run BEFORE the facade
+        // transitions the turn. A malformed proof fails closed here at decode; a
+        // forged signature / signer mismatch / already-claimed grant fails closed
+        // inside the driver's `verify_and_sign` (provider `verify_resume` + the
+        // sealed-grant CAS) — all before any `AttestedResolved` transition. The
+        // driver reads the authoritative binding itself and re-checks the bound
+        // hash against the proof, so the caller can only attest to the bound hash
+        // (threat #3), never redefine it.
         let proof = decode_proof(claim)?;
         let signing_gate_ref = SigningGateRef::new(gate_ref.as_str());
 
         // External-wallet path only: the wallet already signed, so no custodial
         // EVM transaction is supplied. The custodial path is selected purely by
         // the authoritative binding's `provider_id` (never by the caller).
+        let verified = self
+            .driver
+            .verify_and_sign::<NoEvmTx>(&signing_gate_ref, &proof, None)
+            .await
+            .map_err(map_continuation_error)?;
+
+        Ok(VerifiedAttestedContinuation::new(verified))
+    }
+
+    async fn broadcast_resolved(
+        &self,
+        _scope: &TurnScope,
+        _run_id: TurnRunId,
+        _gate_ref: &GateRef,
+        verified: VerifiedAttestedContinuation,
+    ) -> Result<AttestedContinuationOutcome, AttestedContinuationRejection> {
+        // Recover the concrete verified continuation produced by
+        // `verify_and_claim`. A type mismatch (only possible if a different port
+        // implementation produced the handle) fails closed rather than panicking.
+        let verified = *verified
+            .downcast::<VerifiedContinuation>()
+            .map_err(|_| AttestedContinuationRejection::ProofRejected)?;
+
+        // Broadcast only — the proof is already verified and the grant already
+        // claimed. No re-verification, no re-claim.
         let outcome = self
             .driver
-            .continue_after_resolved::<NoEvmTx>(&signing_gate_ref, &proof, None)
+            .broadcast_signed_continuation(verified)
             .await
             .map_err(map_continuation_error)?;
 

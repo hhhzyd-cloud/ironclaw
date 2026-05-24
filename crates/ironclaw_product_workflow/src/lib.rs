@@ -45,7 +45,7 @@ pub use action::{
 };
 pub use attested_continuation::{
     AttestedContinuationOutcome, AttestedContinuationRejection, AttestedGateContinuationPort,
-    AttestedProofClaim, AttestedProofKind,
+    AttestedProofClaim, AttestedProofKind, VerifiedAttestedContinuation,
 };
 pub use binding::{
     ConversationBindingService, ProductConversationRouteKind, ResolveBindingRequest,

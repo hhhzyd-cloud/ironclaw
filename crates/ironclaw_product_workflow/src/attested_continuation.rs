@@ -7,23 +7,32 @@
 //! deterministic sign + broadcast continuation once a `BlockedAttested` gate has
 //! been resolved to `AttestedResolved`.
 //!
-//! The bridge is this injected port. The facade:
+//! The bridge is this injected port. The facade (atomic verify-before-resume,
+//! PR11 item B):
 //!
 //! 1. Translates the browser-supplied attested-proof resolution into an opaque
 //!    [`AttestedProofClaim`] (all fields are strings / JSON — no crypto types).
-//! 2. Builds a `ResumeTurnRequest { attestation: Some(..) }` whose
-//!    [`ironclaw_turns::AttestationClaimRef`] is the proof's bound-hash claim,
-//!    and calls `resume_turn`. The injected `AttestedResumePort` (wired in the
-//!    composition layer, outside `src/`) runs the synchronous binding re-check +
-//!    one-shot resume guard and transitions the turn to `AttestedResolved`.
-//! 3. Calls [`AttestedGateContinuationPort::continue_resolved_gate`] to run the
-//!    heavyweight verification + sign + broadcast through the composition's
-//!    signer-continuation driver.
+//! 2. Calls [`AttestedGateContinuationPort::verify_and_claim`] BEFORE touching
+//!    the turn store. This runs the FULL cryptographic verification (real
+//!    signature recovery / WebAuthn assertion) AND claims the one-shot sealed
+//!    grant. On ANY failure the turn is left `BlockedAttested` with zero
+//!    state-machine mutation — the facade never calls `resume_turn`.
+//! 3. Only on success, builds a `ResumeTurnRequest { attestation: Some(..) }`
+//!    whose [`ironclaw_turns::AttestationClaimRef`] is the proof's bound-hash
+//!    claim, and calls `resume_turn`. The injected `AttestedResumePort` (wired
+//!    in the composition layer, outside `src/`) runs the synchronous binding
+//!    re-check + one-shot resume guard (defense in depth — it does NOT re-claim)
+//!    and transitions the turn to `AttestedResolved`.
+//! 4. Calls [`AttestedGateContinuationPort::broadcast_resolved`] with the
+//!    [`VerifiedAttestedContinuation`] handle from step 2 to drive the
+//!    sign-output broadcast. No re-verification, no re-claim.
 //!
 //! The production implementation lives in `ironclaw_reborn_composition` over
 //! `ironclaw_attested_runtime`'s driver; this crate declares only the
-//! crypto-free contract and the opaque DTOs. Mirrors how the turn store already
-//! takes an injected `AttestedResumePort`.
+//! crypto-free contract and the opaque DTOs/handle. Mirrors how the turn store
+//! already takes an injected `AttestedResumePort`.
+
+use std::any::Any;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -123,51 +132,82 @@ impl AttestedContinuationRejection {
     }
 }
 
+/// Opaque, crypto-free handle proving that [`AttestedGateContinuationPort::verify_and_claim`]
+/// ran successfully: the proof's full signature was verified and the one-shot
+/// sealed grant was claimed. The facade holds it between `verify_and_claim` and
+/// [`AttestedGateContinuationPort::broadcast_resolved`] without inspecting it —
+/// the composition-layer implementation downcasts it back to its concrete
+/// verified-continuation type. This crate confers no trust and names no crypto
+/// type; the handle is just an opaque token.
+pub struct VerifiedAttestedContinuation {
+    inner: Box<dyn Any + Send>,
+}
+
+impl VerifiedAttestedContinuation {
+    /// Wrap a composition-layer verified continuation as an opaque handle.
+    pub fn new<T: Any + Send>(inner: T) -> Self {
+        Self {
+            inner: Box::new(inner),
+        }
+    }
+
+    /// Recover the concrete verified continuation. Returns the boxed value back
+    /// on a type mismatch so the caller can fail closed rather than panic.
+    pub fn downcast<T: Any + Send>(self) -> Result<Box<T>, VerifiedAttestedContinuation> {
+        match self.inner.downcast::<T>() {
+            Ok(value) => Ok(value),
+            Err(inner) => Err(Self { inner }),
+        }
+    }
+}
+
+impl std::fmt::Debug for VerifiedAttestedContinuation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedAttestedContinuation").finish()
+    }
+}
+
 /// Injected, crypto-free continuation port for attested-signing gate resolution.
 ///
 /// Implementations live outside this crate (composition / reborn layer). The
-/// facade calls [`Self::continue_resolved_gate`] exactly once per attested
-/// resolution, *after* `resume_turn` has driven the turn to `AttestedResolved`
-/// (i.e. after the synchronous resume-port binding re-check + one-shot guard
-/// already passed). The implementation runs the heavyweight provider
-/// verification, the sealed-grant CAS, and the ledger-guarded sign + broadcast.
+/// facade (atomic verify-before-resume, PR11 item B) calls
+/// [`Self::verify_and_claim`] BEFORE `resume_turn` and
+/// [`Self::broadcast_resolved`] AFTER. The full cryptographic verification and
+/// the one-shot sealed-grant claim run in `verify_and_claim`, so they gate the
+/// `BlockedAttested -> AttestedResolved` transition; the broadcast half never
+/// re-verifies or re-claims.
 #[async_trait]
 pub trait AttestedGateContinuationPort: Send + Sync {
-    /// Non-mutating preflight run BEFORE `resume_turn`, so the facade only
-    /// commits the `BlockedAttested -> AttestedResolved` transition (which clears
-    /// the gate and consumes the one-shot resume guard) for a claim that will not
-    /// be rejected outright.
+    /// Run the FULL cryptographic verification (real signature recovery /
+    /// WebAuthn assertion) AND claim the one-shot sealed grant for the resolved
+    /// gate — all BEFORE the turn transitions. On success returns an opaque
+    /// [`VerifiedAttestedContinuation`] handle the facade passes back to
+    /// [`Self::broadcast_resolved`] after `resume_turn`.
     ///
-    /// This decodes the opaque [`AttestedProofClaim`] and re-checks it against
-    /// the authoritative gate binding the implementation persisted at gate-raise
-    /// (proof family / provider match, embedded approved-tx-hash equals the bound
-    /// hash). It MUST NOT mutate any run/mission/gate/ledger/grant state: a
-    /// failure here leaves the turn `BlockedAttested` with no side effects.
-    ///
-    /// NOTE: the heavyweight cryptographic signature verification + sealed-grant
-    /// CAS still runs in [`Self::continue_resolved_gate`] AFTER the transition,
-    /// because the only verification entrypoint
-    /// (`SigningProvider::verify_resume`) atomically claims the one-shot grant and
-    /// so cannot be invoked twice. Moving the signature check ahead of the
-    /// transition without claiming the grant requires splitting verify-vs-claim
-    /// inside `ironclaw_attested_runtime` (PR10) — a flagged coordination item,
-    /// not changed on this branch.
-    async fn verify_resolution(
+    /// On ANY failure (malformed/forged proof, signer/hash mismatch, provider
+    /// mismatch, grant already claimed, missing binding) it returns a sanitized
+    /// rejection and MUST leave the turn `BlockedAttested` with NO
+    /// run/mission/gate state-machine mutation: the facade never calls
+    /// `resume_turn` for a claim that fails here. (A failed claim may have
+    /// advanced the implementation's own ledger/grant fail-closed state; that is
+    /// internal one-shot bookkeeping, never a turn-state transition, and means a
+    /// retry of the same gate is refused rather than double-driven.)
+    async fn verify_and_claim(
         &self,
         scope: &TurnScope,
         run_id: TurnRunId,
         gate_ref: &GateRef,
         claim: &AttestedProofClaim,
-    ) -> Result<(), AttestedContinuationRejection>;
+    ) -> Result<VerifiedAttestedContinuation, AttestedContinuationRejection>;
 
-    /// Drive the deterministic sign + broadcast continuation for the resolved
-    /// gate. `scope`/`run_id` identify the run; `gate_ref` selects the
-    /// authoritative binding; `claim` carries the opaque verified-proof payload.
-    async fn continue_resolved_gate(
+    /// Drive the sign-output broadcast for a gate whose proof was already
+    /// verified + grant-claimed in [`Self::verify_and_claim`]. Consumes the
+    /// opaque handle; performs NO re-verification and NO re-claim.
+    async fn broadcast_resolved(
         &self,
         scope: &TurnScope,
         run_id: TurnRunId,
         gate_ref: &GateRef,
-        claim: &AttestedProofClaim,
+        verified: VerifiedAttestedContinuation,
     ) -> Result<AttestedContinuationOutcome, AttestedContinuationRejection>;
 }
