@@ -266,6 +266,9 @@ impl EventProjectionService for FailingUpdatesProjectionService {
             ProjectionError::InvalidRequest { reason } => {
                 ProjectionError::InvalidRequest { reason }
             }
+            ProjectionError::MissingProjectionMetadata { field } => {
+                ProjectionError::MissingProjectionMetadata { field: *field }
+            }
             ProjectionError::RebaseRequired {
                 requested,
                 earliest,
@@ -299,6 +302,9 @@ impl EventProjectionService for FailingSnapshotProjectionService {
         Err(match &self.error {
             ProjectionError::InvalidRequest { reason } => {
                 ProjectionError::InvalidRequest { reason }
+            }
+            ProjectionError::MissingProjectionMetadata { field } => {
+                ProjectionError::MissingProjectionMetadata { field: *field }
             }
             ProjectionError::RebaseRequired {
                 requested,
