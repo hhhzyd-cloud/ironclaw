@@ -40,7 +40,7 @@ fn signing_provider_trait_crate_has_no_chain_crypto_or_secrets_dependency() {
 
     let normal_dependencies: BTreeSet<&str> = dependencies
         .iter()
-        .filter(|dependency| dependency.get("kind").map_or(true, Value::is_null))
+        .filter(|dependency| dependency.get("kind").is_none_or(Value::is_null))
         .filter_map(|dependency| dependency["name"].as_str())
         .collect();
     let allowed_dependencies: BTreeSet<&str> =
