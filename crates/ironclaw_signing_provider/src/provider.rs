@@ -42,6 +42,16 @@ pub enum TrustModel {
     Custodial,
 }
 
+impl ProviderId {
+    /// Return the canonical trust model for this provider identity.
+    pub fn trust_model(self) -> TrustModel {
+        match self {
+            Self::WalletConnect | Self::Injected | Self::NearRedirect => TrustModel::ExternalWallet,
+            Self::Custodial => TrustModel::Custodial,
+        }
+    }
+}
+
 /// The outcome of [`SigningProvider::initiate`].
 ///
 /// `initiate` does not sign. It prepares whatever the chosen provider needs to
@@ -89,7 +99,9 @@ pub trait SigningProvider: Send + Sync {
     fn provider_id(&self) -> ProviderId;
 
     /// The trust model this provider operates under.
-    fn trust_model(&self) -> TrustModel;
+    fn trust_model(&self) -> TrustModel {
+        self.provider_id().trust_model()
+    }
 
     /// Prepare the human-in-the-loop ceremony for a bound transaction.
     ///
@@ -167,6 +179,23 @@ mod tests {
     }
 
     #[test]
+    fn provider_id_maps_to_canonical_trust_model() {
+        assert_eq!(
+            ProviderId::WalletConnect.trust_model(),
+            TrustModel::ExternalWallet
+        );
+        assert_eq!(
+            ProviderId::Injected.trust_model(),
+            TrustModel::ExternalWallet
+        );
+        assert_eq!(
+            ProviderId::NearRedirect.trust_model(),
+            TrustModel::ExternalWallet
+        );
+        assert_eq!(ProviderId::Custodial.trust_model(), TrustModel::Custodial);
+    }
+
+    #[test]
     fn initiation_outcome_round_trips() {
         let outcome = InitiationOutcome::AwaitingUserAction {
             directive: vec![1, 2, 3],
@@ -185,7 +214,6 @@ mod tests {
     /// `Arc<dyn SigningProvider>`.
     struct MockProvider {
         id: ProviderId,
-        trust: TrustModel,
         accept: bool,
     }
 
@@ -193,10 +221,6 @@ mod tests {
     impl SigningProvider for MockProvider {
         fn provider_id(&self) -> ProviderId {
             self.id
-        }
-
-        fn trust_model(&self) -> TrustModel {
-            self.trust
         }
 
         async fn initiate(
@@ -212,11 +236,15 @@ mod tests {
         async fn verify_resume(
             &self,
             _context: &SigningContext,
-            _approved_tx_hash: &ApprovedTxHash,
+            approved_tx_hash: &ApprovedTxHash,
             proof: &SigningProof,
         ) -> Result<VerifiedProof, SigningProviderError> {
             if self.accept {
-                Ok(VerifiedProof::new(proof.clone()))
+                Ok(VerifiedProof::new(
+                    self.provider_id(),
+                    *approved_tx_hash,
+                    proof.clone(),
+                ))
             } else {
                 Err(SigningProviderError::SignerMismatch)
             }
@@ -227,7 +255,6 @@ mod tests {
     async fn mock_provider_is_object_safe_and_drivable_via_dyn_arc() {
         let provider: Arc<dyn SigningProvider> = Arc::new(MockProvider {
             id: ProviderId::Injected,
-            trust: TrustModel::ExternalWallet,
             accept: true,
         });
         assert_eq!(provider.provider_id(), ProviderId::Injected);
@@ -249,6 +276,8 @@ mod tests {
             .verify_resume(&ctx, &hash, &proof)
             .await
             .expect("verify");
+        assert_eq!(verified.provider_id(), ProviderId::Injected);
+        assert_eq!(verified.approved_tx_hash(), &hash);
         assert_eq!(verified.proof(), &proof);
     }
 
@@ -256,7 +285,6 @@ mod tests {
     async fn mock_provider_surfaces_signer_mismatch() {
         let provider: Arc<dyn SigningProvider> = Arc::new(MockProvider {
             id: ProviderId::Custodial,
-            trust: TrustModel::Custodial,
             accept: false,
         });
         let ctx = sample_context();

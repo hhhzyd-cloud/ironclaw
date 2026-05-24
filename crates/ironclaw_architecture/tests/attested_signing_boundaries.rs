@@ -10,27 +10,14 @@
 //!
 //! See `docs/plans/2026-05-23-attested-signing-substrate.md`.
 
+use std::collections::BTreeSet;
 use std::process::Command;
 
 use serde_json::Value;
 
-/// The dependency names the signing-provider trait crate must never carry —
-/// chain SDKs, crypto primitives, and key-custody crates. Matched as a prefix
-/// against each dependency name so e.g. `alloy`, `alloy-primitives`, and
-/// `solana-program` are all covered.
-const FORBIDDEN_DEPENDENCY_PREFIXES: &[&str] = &[
-    "solana-sdk",
-    "solana-program",
-    "solana",
-    "near-",
-    "alloy",
-    "k256",
-    "sha3",
-    "webauthn-rs",
-    "ironclaw_secrets",
-    "ironclaw_chain_signing",
-    "ironclaw_attestation",
-];
+/// The only normal dependencies allowed in the signing-provider trait crate.
+/// Dev/build dependencies are excluded from this assertion.
+const ALLOWED_NORMAL_DEPENDENCIES: &[&str] = &["async-trait", "serde", "thiserror"];
 
 #[test]
 fn signing_provider_trait_crate_has_no_chain_crypto_or_secrets_dependency() {
@@ -47,34 +34,25 @@ fn signing_provider_trait_crate_has_no_chain_crypto_or_secrets_dependency() {
              Cargo.toml `workspace.members` (see attested-signing PR1)",
         );
 
-    // Cover every dependency kind (normal, dev, build): the purity invariant
-    // applies to the whole manifest. A chain/crypto crate sneaking in as a
-    // dev-dependency would still mean the trait crate's tests reach for chain
-    // code, defeating the "trait crate names types without chain deps" goal.
     let dependencies = package["dependencies"]
         .as_array()
         .expect("package dependencies must be an array");
 
-    let mut violations = Vec::new();
-    for dependency in dependencies {
-        let Some(name) = dependency["name"].as_str() else {
-            continue;
-        };
-        for forbidden in FORBIDDEN_DEPENDENCY_PREFIXES {
-            if name == *forbidden || name.starts_with(forbidden) {
-                let kind = dependency["kind"].as_str().unwrap_or("normal").to_string();
-                violations.push(format!("{name} (kind: {kind}) matched `{forbidden}`"));
-            }
-        }
-    }
+    let normal_dependencies: BTreeSet<&str> = dependencies
+        .iter()
+        .filter(|dependency| dependency.get("kind").map_or(true, Value::is_null))
+        .filter_map(|dependency| dependency["name"].as_str())
+        .collect();
+    let allowed_dependencies: BTreeSet<&str> =
+        ALLOWED_NORMAL_DEPENDENCIES.iter().copied().collect();
 
-    assert!(
-        violations.is_empty(),
+    assert_eq!(
+        normal_dependencies, allowed_dependencies,
         "ironclaw_signing_provider is the pure trait crate at the base of the attested-signing \
-         stack and must carry no chain/crypto/secrets dependency. Forbidden dependencies found:\n{}\n\
+         stack and must carry exactly the approved normal dependencies. Dev/build dependencies \
+         are excluded from this assertion.\n\
          Concrete chain/crypto types belong in ironclaw_attestation (PR2) and the chain crates, \
          not the trait crate. See docs/plans/2026-05-23-attested-signing-substrate.md.",
-        violations.join("\n")
     );
 }
 

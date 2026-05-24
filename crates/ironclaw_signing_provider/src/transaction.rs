@@ -75,9 +75,11 @@ impl RenderedTx {
 pub struct ApprovedTxHash([u8; APPROVED_TX_HASH_LEN]);
 
 impl ApprovedTxHash {
-    /// Construct from raw 32 bytes. The bytes are assumed to already be the
-    /// domain-separated digest computed by `ironclaw_attestation` (PR2); this
-    /// crate performs no hashing.
+    /// Construct from an already-computed domain-separated attested digest.
+    ///
+    /// NEVER construct from client- or resume-supplied bytes; the hash must be
+    /// recomputed server-side from the canonical fields (threat:
+    /// caller-supplied hash). This crate performs no hashing.
     pub fn from_bytes(bytes: [u8; APPROVED_TX_HASH_LEN]) -> Self {
         Self(bytes)
     }

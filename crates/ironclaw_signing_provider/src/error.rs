@@ -9,6 +9,7 @@ use thiserror::Error;
 /// a grant that could not be claimed one-shot, an invalid proof, or a scope
 /// violation. Providers map their own internal failures onto these variants so
 /// the resume path can reason about them uniformly.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum SigningProviderError {
     /// The signer / account recovered from the proof did not match the account
