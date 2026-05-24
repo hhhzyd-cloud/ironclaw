@@ -1,0 +1,119 @@
+//! Attested-signing signer-continuation wiring for the reborn runtime (PR10).
+//!
+//! This is the composition seam that turns an `AttestedResolved` turn into a
+//! real, ledger-guarded sign + broadcast. It assembles the
+//! [`AttestedSignerContinuationDriver`] from the in-memory substrate stores
+//! (gate bindings shared with the resume port, sealed grants, broadcast ledger)
+//! and the external-wallet provider registry.
+//!
+//! The driver is constructed here rather than buried in the giant
+//! `RebornRuntime` struct so the runtime does not have to name the custodial
+//! signer's concrete keystore/grant/ledger generic parameters. PR11's web
+//! ingress (`/api/chat/gate/resolve`) calls
+//! [`RebornAttestedComposition::driver`] to continue a resolved gate; this
+//! module owns the deny-first default policy and the in-memory stores (durable
+//! backends are PR12).
+//!
+//! Why in-memory only: the prompt for this slice mandates the existing
+//! in-memory stores and explicitly defers durable PG/libSQL backends to PR12,
+//! so no single-backend persistence feature is introduced here (dual-backend
+//! rule).
+
+use std::sync::Arc;
+
+use ironclaw_attestation::{InMemorySealedGrantStore, InMemorySigningLedger};
+use ironclaw_attested_runtime::{
+    AttestedSignerContinuationDriver, Broadcaster, ContinuationError,
+    InMemoryAttestedGateBindingStore, ProviderRegistry,
+};
+use ironclaw_chain_signing::{CustodialSigner, DenyFirstCustodyPolicy, SecretsKeyStore, ShipGate};
+use ironclaw_signing_provider::SigningContext;
+
+/// The concrete custodial signer type the local-dev composition assembles. Its
+/// generic parameters are pinned here so the rest of the runtime never names
+/// them.
+pub(crate) type LocalDevCustodialSigner =
+    CustodialSigner<SecretsKeyStore, InMemorySealedGrantStore, InMemorySigningLedger>;
+
+/// The concrete driver type the local-dev composition assembles.
+pub(crate) type LocalDevContinuationDriver = AttestedSignerContinuationDriver<
+    NoopBroadcaster,
+    InMemorySigningLedger,
+    LocalDevCustodialSigner,
+>;
+
+/// A broadcaster that records intent but performs no network I/O. The
+/// deterministic-continuation ledger guard (threats #6 / #7) is exercised
+/// identically regardless of the broadcaster; the real per-chain broadcaster is
+/// a PR12 / production concern.
+#[derive(Debug, Default)]
+pub struct NoopBroadcaster;
+
+#[async_trait::async_trait]
+impl Broadcaster for NoopBroadcaster {
+    async fn broadcast(
+        &self,
+        _context: &SigningContext,
+        _signed: &[u8],
+    ) -> Result<String, ContinuationError> {
+        // No network submit; the ledger advance around this call is what the
+        // idempotency guard protects. Returns a deterministic placeholder id.
+        Ok("noop-broadcast".to_string())
+    }
+}
+
+/// Bundles the attested-signing composition the reborn runtime exposes to the
+/// PR11 ingress: the shared binding store and the assembled continuation
+/// driver.
+pub struct RebornAttestedComposition {
+    bindings: Arc<InMemoryAttestedGateBindingStore>,
+    driver: Arc<LocalDevContinuationDriver>,
+}
+
+impl RebornAttestedComposition {
+    /// Assemble the composition for local-dev from the gate-binding store the
+    /// resume port already shares, a custodial keystore, the operator
+    /// ship-gate, and the shared sealed-grant store. The grant store is shared
+    /// so the one-shot CAS (threat #1) is authoritative across both the
+    /// custodial signer and the external-wallet providers (which the PR11
+    /// ingress registers into `providers` over the same store). The broadcast
+    /// ledger is a fresh in-memory instance shared between the custodial signer
+    /// and the driver.
+    pub fn new(
+        bindings: Arc<InMemoryAttestedGateBindingStore>,
+        keystore: Arc<SecretsKeyStore>,
+        ship_gate: ShipGate,
+        grants: Arc<InMemorySealedGrantStore>,
+        providers: ProviderRegistry,
+    ) -> Self {
+        let ledger = Arc::new(InMemorySigningLedger::new());
+        let custodial_signer = Arc::new(CustodialSigner::new(
+            keystore,
+            Arc::clone(&grants),
+            Arc::clone(&ledger),
+            ship_gate,
+            Arc::new(DenyFirstCustodyPolicy),
+        ));
+        let driver = Arc::new(AttestedSignerContinuationDriver::new(
+            Arc::clone(&bindings) as Arc<dyn ironclaw_attested_runtime::AttestedGateBindingStore>,
+            providers,
+            custodial_signer,
+            ledger,
+            Arc::new(NoopBroadcaster),
+        ));
+        Self { bindings, driver }
+    }
+
+    /// The authoritative gate-binding store. The PR11 ingress persists a
+    /// binding here when it raises an attested gate, and the driver reads it
+    /// back on continuation.
+    pub fn bindings(&self) -> &Arc<InMemoryAttestedGateBindingStore> {
+        &self.bindings
+    }
+
+    /// The assembled signer-continuation driver dispatched when a turn reaches
+    /// `AttestedResolved`.
+    pub fn driver(&self) -> &Arc<LocalDevContinuationDriver> {
+        &self.driver
+    }
+}

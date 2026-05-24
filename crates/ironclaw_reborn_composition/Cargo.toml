@@ -84,6 +84,13 @@ ironclaw_secrets = { path = "../ironclaw_secrets" }
 ironclaw_threads = { path = "../ironclaw_threads" }
 ironclaw_trust = { path = "../ironclaw_trust" }
 ironclaw_turns = { path = "../ironclaw_turns" }
+# Attested-signing composition glue (PR10): AttestedResumePort + signer
+# continuation driver + ship-gate. Lives outside src/ per the binary-boundary
+# rule; this is the composition layer where the substrate is wired together.
+ironclaw_attested_runtime = { path = "../ironclaw_attested_runtime" }
+ironclaw_attestation = { path = "../ironclaw_attestation" }
+ironclaw_chain_signing = { path = "../ironclaw_chain_signing" }
+ironclaw_signing_provider = { path = "../ironclaw_signing_provider" }
 # WebUI v2 route surface — feature-gated; only used by `webui_serve`.
 ironclaw_webui_v2 = { path = "../ironclaw_webui_v2", optional = true }
 libsql = { version = "0.6", optional = true, default-features = false, features = ["core", "replication", "remote", "tls"] }

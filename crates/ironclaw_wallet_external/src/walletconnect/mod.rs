@@ -236,9 +236,13 @@ impl SigningProvider for WalletConnectSigningProvider {
         let key = GrantKey::from_context(context, *approved_tx_hash);
         self.grants.claim(&key).await.map_err(map_grant_error)?;
 
-        // PR10: hand the verified proof back to the gate / runner for the
-        // deterministic post-approval continuation (broadcast via
-        // ironclaw_chain_signing). PR9 stops at the verified-proof boundary.
+        // The verified proof is handed back to the composition-layer
+        // signer-continuation driver
+        // (`ironclaw_attested_runtime::AttestedSignerContinuationDriver`, PR10),
+        // which performs the deterministic post-approval broadcast via
+        // `ironclaw_chain_signing` under the broadcast-idempotency ledger. This
+        // crate (a lower-stack provider) deliberately stops at the
+        // verified-proof boundary and never depends on the runtime crate.
         Ok(VerifiedProof::new(proof.clone()))
     }
 }
