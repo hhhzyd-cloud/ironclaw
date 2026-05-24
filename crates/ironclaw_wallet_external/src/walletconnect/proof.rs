@@ -1,0 +1,85 @@
+//! Wire shape of the WalletConnect v2 signing proof.
+//!
+//! Serialized into the opaque [`SigningProof::WalletConnectProof`](ironclaw_signing_provider::SigningProof::WalletConnectProof)
+//! byte body. The payload echoes everything the verifier re-checks against the
+//! recorded [`SessionBinding`](super::session::SessionBinding) and the bound
+//! account — none of it is trusted on its own.
+
+use serde::{Deserialize, Serialize};
+
+use ironclaw_signing_provider::{ApprovedTxHash, SigningProviderError};
+
+use super::hex_bytes;
+
+/// The structured payload a WalletConnect wallet carries back from the v2
+/// signing ceremony.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletConnectProofPayload {
+    /// The WalletConnect session topic this proof was minted under. Must equal
+    /// the recorded session binding (T18).
+    pub session_topic: String,
+    /// The approved-tx hash the wallet attests to. Must equal the bound hash
+    /// (T20); re-checked before any signature work.
+    pub approved_tx_hash: ApprovedTxHash,
+    /// The account the wallet claims signed. Re-derived from the signature
+    /// (EVM) / checked against the public key (ed25519) and compared to the
+    /// bound account; never trusted on its own (T17).
+    pub claimed_signer: String,
+    /// Per-request nonce the wallet committed to. Must equal the recorded
+    /// binding nonce (T18).
+    #[serde(with = "hex_bytes")]
+    pub nonce: Vec<u8>,
+    /// The signature over the domain-separated attestation digest. 65 bytes
+    /// (r ∥ s ∥ v) for EVM, 64 bytes for ed25519 families.
+    #[serde(with = "hex_bytes")]
+    pub signature: Vec<u8>,
+    /// For the ed25519 families (Solana / NEAR), the 32-byte public key the
+    /// signature verifies against (lowercase hex). Unused for EVM.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_hex_bytes"
+    )]
+    pub public_key: Option<Vec<u8>>,
+}
+
+/// Serialize a [`WalletConnectProofPayload`] into opaque proof bytes.
+pub fn encode_walletconnect_proof(payload: &WalletConnectProofPayload) -> Vec<u8> {
+    serde_json::to_vec(payload).unwrap_or_default()
+}
+
+/// Decode opaque proof bytes into a structured [`WalletConnectProofPayload`].
+pub fn decode_walletconnect_proof(
+    bytes: &[u8],
+) -> Result<WalletConnectProofPayload, SigningProviderError> {
+    serde_json::from_slice(bytes).map_err(|e| SigningProviderError::ProofInvalid {
+        reason: format!("malformed walletconnect proof payload: {e}"),
+    })
+}
+
+/// Hex (de)serialization helper for `Option<Vec<u8>>` proof fields.
+mod opt_hex_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        bytes: &Option<Vec<u8>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match bytes {
+            Some(b) => s.serialize_str(&super::hex_bytes::hex_encode(b)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<Vec<u8>>, D::Error> {
+        let opt = Option::<String>::deserialize(d)?;
+        match opt {
+            Some(s) => super::hex_bytes::hex_decode(&s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}

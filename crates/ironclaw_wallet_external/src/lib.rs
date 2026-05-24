@@ -56,8 +56,14 @@
 #![forbid(unsafe_code)]
 
 mod injected;
+mod walletconnect;
 
 pub use injected::{
     InjectedProofPayload, InjectedScheme, InjectedSigningProvider, decode_injected_proof,
     encode_injected_proof,
+};
+pub use walletconnect::{
+    ChainFamily, PinnedScope, ProjectId, ProposedScope, SessionBinding, SessionBindingStore,
+    WalletConnectProofPayload, WalletConnectSigningProvider, attestation_digest_for_test,
+    decode_walletconnect_proof, encode_walletconnect_proof, enforce_pinned_scope,
 };
