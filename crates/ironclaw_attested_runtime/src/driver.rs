@@ -273,7 +273,10 @@ where
     ///    re-broadcast fail — threats #6 / #7).
     /// 3. Route to the bound provider / custodial signer to verify + claim the
     ///    sealed grant (threat #1) and produce the signature.
-    /// 4. Advance the ledger to `BroadcastSubmitted` and broadcast.
+    /// 4. Advance the ledger to `BroadcastSubmitted` (the in-flight marker) and
+    ///    broadcast. On a confirmed submit the row stays at `BroadcastSubmitted`;
+    ///    on a broadcast error / ambiguous outcome it moves to the `Unknown`
+    ///    terminal for out-of-band recovery (never auto-rebroadcast).
     pub async fn continue_after_resolved(
         &self,
         gate_ref: &GateRef,
@@ -426,7 +429,29 @@ where
     /// ([`Broadcaster::submits`] == true), advance the ledger to
     /// `BroadcastSubmitted` BEFORE the network submit so a `Stuck->InProgress`
     /// recovery that re-enters here sees the row already at `BroadcastSubmitted`
-    /// and the guard refuses a second signing (threat #7).
+    /// and the guard refuses a second signing (threat #7). `BroadcastSubmitted`
+    /// here is the post-submit-attempt in-flight marker, NOT yet a confirmed
+    /// landing.
+    ///
+    /// **Broadcast-failure recovery (item C):** a network error, timeout, or an
+    /// ambiguous/contradictory outcome leaves the chain status genuinely unknown
+    /// (the tx may or may not have been accepted). Rather than leaving the row
+    /// stuck with no path forward, we move it to the [`SigningLedgerState::Unknown`]
+    /// terminal and carry the attempted-tx / error evidence in the surfaced
+    /// error. `Unknown` is terminal and is NEVER auto-retried with a fresh
+    /// nonce/blockhash — recovery requires explicit out-of-band resolution /
+    /// re-approval, so the one-shot + idempotency guarantees still hold (a
+    /// retried continuation against the existing row fails closed at `create`).
+    ///
+    /// We confirm the ledger to a SUCCESS-only terminal contract: the returned
+    /// outcome reports `BroadcastSubmitted` only on a confirmed
+    /// [`BroadcastOutcome::Submitted`] with a real tx id.
+    ///
+    // follow-up: `BroadcastSubmitted` currently doubles as the in-flight marker
+    // because the `SigningLedger` state machine in `ironclaw_attestation` has no
+    // distinct `Broadcasting` state. Adding one (so `BroadcastSubmitted` strictly
+    // means "accepted by the network") is a cross-crate, additive change deferred
+    // to a follow-up to avoid colliding with the PR11 driver refactor.
     ///
     /// For a non-broadcasting (dry-run / local-dev) broadcaster, the ledger is
     /// left at `Signed` and the outcome is [`BroadcastDisposition::NotBroadcast`]:
@@ -440,26 +465,41 @@ where
         signer: String,
     ) -> Result<SignerContinuationOutcome, ContinuationError> {
         if self.broadcaster.submits() {
-            // Real submit: advance the ledger first (idempotency guard), then
-            // submit under the guard.
+            // Real submit: advance the ledger to the in-flight marker first
+            // (idempotency guard — a recovery re-entry now sees a broadcast row
+            // and is refused a second signing), then submit under the guard.
             self.ledger
                 .advance(gate_ref, SigningLedgerState::BroadcastSubmitted)
                 .await?;
-            match self.broadcaster.broadcast(context, signed).await? {
-                BroadcastOutcome::Submitted { tx_id } => Ok(SignerContinuationOutcome {
+            match self.broadcaster.broadcast(context, signed).await {
+                Ok(BroadcastOutcome::Submitted { tx_id }) => Ok(SignerContinuationOutcome {
                     gate_ref: gate_ref.clone(),
                     ledger_state: SigningLedgerState::BroadcastSubmitted,
                     broadcast: BroadcastDisposition::Submitted { tx_id },
                     signer,
                 }),
                 // A broadcaster that declared `submits() == true` but returned
-                // NotBroadcast is contradictory; fail closed rather than report
-                // a false broadcast or a false non-broadcast.
-                BroadcastOutcome::NotBroadcast { reason } => Err(ContinuationError::Broadcast {
-                    reason: format!(
-                        "broadcaster declared submits()==true but did not broadcast: {reason}"
-                    ),
-                }),
+                // NotBroadcast is contradictory: we cannot trust that the tx did
+                // NOT go out, so treat it as an unknown-outcome failure and move
+                // to the terminal recovery state rather than reporting a false
+                // broadcast or a false non-broadcast.
+                Ok(BroadcastOutcome::NotBroadcast { reason }) => {
+                    self.recover_unknown(gate_ref).await;
+                    Err(ContinuationError::Broadcast {
+                        reason: format!(
+                            "broadcaster declared submits()==true but did not broadcast: \
+                             {reason} (ledger moved to Unknown for recovery)"
+                        ),
+                    })
+                }
+                // A broadcast error (RPC timeout, rejected/invalid response). The
+                // tx may or may not have landed — genuinely unknown. Move the row
+                // to the Unknown terminal so it is never left stuck and never
+                // auto-rebroadcast, and surface the evidence.
+                Err(err) => {
+                    self.recover_unknown(gate_ref).await;
+                    Err(Self::annotate_broadcast_failure(err))
+                }
             }
         } else {
             // Dry-run / local-dev: never advance to BroadcastSubmitted. Record
@@ -481,6 +521,48 @@ where
                 broadcast: BroadcastDisposition::NotBroadcast { reason },
                 signer,
             })
+        }
+    }
+
+    /// Move a row that has reached the in-flight `BroadcastSubmitted` marker to
+    /// the [`SigningLedgerState::Unknown`] terminal after a failed/ambiguous
+    /// broadcast, so it is never left stuck and never auto-rebroadcast.
+    ///
+    /// Best-effort: the original broadcast failure is the authoritative error we
+    /// surface, so a secondary ledger error here (e.g. the row is already past
+    /// `BroadcastSubmitted` due to a concurrent finalize) must NOT mask it. We
+    /// only need the row to NOT be stuck at a non-terminal state; if the
+    /// transition is rejected the row was already at/heading to a terminal.
+    async fn recover_unknown(&self, gate_ref: &GateRef) {
+        if let Err(e) = self
+            .ledger
+            .advance(gate_ref, SigningLedgerState::Unknown)
+            .await
+        {
+            // The row is already at or past a terminal in this case; nothing
+            // actionable here. Keep the original broadcast error authoritative.
+            debug_assert!(
+                matches!(
+                    e,
+                    ironclaw_attestation::LedgerError::InvalidTransition { .. }
+                ),
+                "unexpected ledger error while recovering to Unknown: {e:?}"
+            );
+        }
+    }
+
+    /// Annotate a broadcaster-side failure so the surfaced error records that the
+    /// ledger was moved to the `Unknown` terminal for recovery, preserving any
+    /// available evidence (the broadcaster's opaque reason / attempted tx hash)
+    /// without leaking key material.
+    fn annotate_broadcast_failure(err: ContinuationError) -> ContinuationError {
+        match err {
+            ContinuationError::Broadcast { reason } => ContinuationError::Broadcast {
+                reason: format!("{reason} (ledger moved to Unknown for recovery)"),
+            },
+            // A non-Broadcast error from the broadcaster path is unexpected but
+            // still fail-closed; pass it through unchanged.
+            other => other,
         }
     }
 }

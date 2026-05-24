@@ -227,12 +227,91 @@ mod recording {
     }
 }
 
+/// A broadcaster that REALLY submits (reports `submits() == true`) and counts
+/// every submit, but always fails the submit with a broadcast error (e.g. an
+/// RPC timeout). Used to exercise broadcast-failure recovery (item C): the
+/// ledger must move to a terminal recovery state and a retry must not
+/// double-broadcast.
+mod failing {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[derive(Default)]
+    pub struct FailingBroadcaster {
+        pub calls: AtomicUsize,
+    }
+
+    impl FailingBroadcaster {
+        pub fn count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ironclaw_attested_runtime::Broadcaster for FailingBroadcaster {
+        fn submits(&self) -> bool {
+            true
+        }
+
+        async fn broadcast(
+            &self,
+            _context: &SigningContext,
+            _signed: &[u8],
+        ) -> Result<ironclaw_attested_runtime::BroadcastOutcome, ContinuationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ContinuationError::Broadcast {
+                reason: "rpc timeout after send".to_string(),
+            })
+        }
+    }
+}
+
 /// The concrete custodial driver type backed by a [`recording::RecordingBroadcaster`].
 type RecordingCustodialDriver = AttestedSignerContinuationDriver<
     recording::RecordingBroadcaster,
     InMemorySigningLedger,
     CustodialSigner<SecretsKeyStore, InMemorySealedGrantStore, InMemorySigningLedger>,
 >;
+
+/// The concrete custodial driver type backed by a [`failing::FailingBroadcaster`].
+type FailingCustodialDriver = AttestedSignerContinuationDriver<
+    failing::FailingBroadcaster,
+    InMemorySigningLedger,
+    CustodialSigner<SecretsKeyStore, InMemorySealedGrantStore, InMemorySigningLedger>,
+>;
+
+/// Assemble a custodial driver wired to a shared failing broadcaster so a test
+/// can assert broadcast-failure recovery and that a retry does not
+/// double-broadcast.
+fn custodial_driver_failing(
+    keystore: Arc<SecretsKeyStore>,
+    bindings: Arc<InMemoryAttestedGateBindingStore>,
+    broadcaster: Arc<failing::FailingBroadcaster>,
+) -> (
+    FailingCustodialDriver,
+    Arc<InMemorySealedGrantStore>,
+    Arc<InMemorySigningLedger>,
+) {
+    let grants = Arc::new(InMemorySealedGrantStore::new());
+    let ledger = Arc::new(InMemorySigningLedger::new());
+    let ship_gate = CustodialMainnetShipGate::new(false).build_chain_ship_gate(None);
+    let signer = Arc::new(CustodialSigner::new(
+        Arc::clone(&keystore),
+        Arc::clone(&grants),
+        Arc::clone(&ledger),
+        ship_gate,
+        Arc::new(DenyFirstCustodyPolicy),
+    ));
+    let driver = AttestedSignerContinuationDriver::new(
+        Arc::clone(&bindings) as Arc<dyn AttestedGateBindingStore>,
+        ProviderRegistry::new(),
+        signer,
+        Arc::clone(&ledger),
+        broadcaster,
+    );
+    (driver, grants, ledger)
+}
 
 /// Assemble a custodial driver wired to a shared recording broadcaster so a
 /// test can assert how many real submits happened.
@@ -588,6 +667,150 @@ async fn threat_7_double_broadcast_blocked_by_ledger_state() {
         "expected ledger guard rejection, got {err:?}"
     );
     // Ledger never regressed out of BroadcastSubmitted.
+    assert_eq!(
+        ledger.state(&gate).await.unwrap(),
+        SigningLedgerState::BroadcastSubmitted
+    );
+}
+
+// ── Item C: broadcast-failure recovery (ledger -> Unknown, no double-cast) ──
+
+/// A broadcast error must NOT leave the ledger stuck. The row moves to the
+/// `Unknown` terminal (genuinely unknown whether the tx landed) and the driver
+/// surfaces a `Broadcast` error carrying the evidence.
+#[tokio::test]
+async fn broadcast_error_moves_ledger_to_unknown_not_stuck() {
+    let priv_bytes = [0x21u8; 32];
+    let (keystore, account) = keystore_with_evm_key(&priv_bytes).await;
+    let ctx = signing_context(&account);
+    let (_tx, decoded, hash) = sample_evm();
+
+    let bindings = Arc::new(InMemoryAttestedGateBindingStore::new());
+    let broadcaster = Arc::new(failing::FailingBroadcaster::default());
+    let (driver, grants, ledger) = custodial_driver_failing(
+        Arc::clone(&keystore),
+        Arc::clone(&bindings),
+        Arc::clone(&broadcaster),
+    );
+    seal_grant(&grants, &ctx, hash).await;
+    put_binding(&bindings, &ctx, decoded, hash).await;
+
+    let gate = SigningGateRef::new(GATE);
+    let proof = SigningProof::WebAuthnAssertionProof(vec![]);
+
+    let err = driver
+        .continue_after_resolved(&gate, &proof)
+        .await
+        .expect_err("a broadcast error must surface, not silently succeed");
+    assert!(
+        matches!(err, ContinuationError::Broadcast { .. }),
+        "expected a Broadcast error, got {err:?}"
+    );
+    // Exactly one submit attempt was made.
+    assert_eq!(broadcaster.count(), 1, "exactly one submit attempt");
+    // The ledger is at the Unknown terminal — NOT stuck at Signing/Signed/
+    // BroadcastSubmitted.
+    let state = ledger.state(&gate).await.unwrap();
+    assert_eq!(
+        state,
+        SigningLedgerState::Unknown,
+        "failed broadcast must move the ledger to the Unknown terminal"
+    );
+    assert!(state.is_terminal(), "Unknown is terminal");
+}
+
+/// A retried continuation after a broadcast failure must NOT double-broadcast.
+/// The ledger row already exists (now at the `Unknown` terminal), so the
+/// one-shot `create` fails closed and the broadcaster is never called again.
+#[tokio::test]
+async fn retry_after_broadcast_failure_does_not_double_broadcast() {
+    let priv_bytes = [0x22u8; 32];
+    let (keystore, account) = keystore_with_evm_key(&priv_bytes).await;
+    let ctx = signing_context(&account);
+    let (_tx, decoded, hash) = sample_evm();
+
+    let bindings = Arc::new(InMemoryAttestedGateBindingStore::new());
+    let broadcaster = Arc::new(failing::FailingBroadcaster::default());
+    let (driver, grants, ledger) = custodial_driver_failing(
+        Arc::clone(&keystore),
+        Arc::clone(&bindings),
+        Arc::clone(&broadcaster),
+    );
+    seal_grant(&grants, &ctx, hash).await;
+    put_binding(&bindings, &ctx, decoded, hash).await;
+
+    let gate = SigningGateRef::new(GATE);
+    let proof = SigningProof::WebAuthnAssertionProof(vec![]);
+
+    // First attempt: broadcast fails -> ledger moves to Unknown.
+    let _ = driver
+        .continue_after_resolved(&gate, &proof)
+        .await
+        .expect_err("first attempt fails the broadcast");
+    assert_eq!(broadcaster.count(), 1, "one submit attempt so far");
+    assert_eq!(
+        ledger.state(&gate).await.unwrap(),
+        SigningLedgerState::Unknown
+    );
+
+    // Retry / recovery re-drive: the one-shot ledger row already exists, so the
+    // continuation is refused fail-closed and the broadcaster is NOT called
+    // again. Recovery from `Unknown` requires explicit out-of-band re-approval,
+    // never an automatic re-broadcast.
+    let err = driver
+        .continue_after_resolved(&gate, &proof)
+        .await
+        .expect_err("retry after a failed broadcast must fail closed");
+    assert!(
+        matches!(err, ContinuationError::Ledger(_)),
+        "expected ledger guard rejection on retry, got {err:?}"
+    );
+    assert_eq!(
+        broadcaster.count(),
+        1,
+        "retry must NOT produce a second broadcast"
+    );
+    // The terminal state is preserved (no regression out of Unknown).
+    assert_eq!(
+        ledger.state(&gate).await.unwrap(),
+        SigningLedgerState::Unknown
+    );
+}
+
+/// A confirmed submission advances the ledger to `BroadcastSubmitted` and
+/// reports a `Submitted` disposition with the real tx id (success contract).
+#[tokio::test]
+async fn confirmed_submission_reaches_broadcast_submitted() {
+    let priv_bytes = [0x23u8; 32];
+    let (keystore, account) = keystore_with_evm_key(&priv_bytes).await;
+    let ctx = signing_context(&account);
+    let (_tx, decoded, hash) = sample_evm();
+
+    let bindings = Arc::new(InMemoryAttestedGateBindingStore::new());
+    let broadcaster = Arc::new(recording::RecordingBroadcaster::default());
+    let (driver, grants, ledger) = custodial_driver_recording(
+        Arc::clone(&keystore),
+        Arc::clone(&bindings),
+        Arc::clone(&broadcaster),
+    );
+    seal_grant(&grants, &ctx, hash).await;
+    put_binding(&bindings, &ctx, decoded, hash).await;
+
+    let gate = SigningGateRef::new(GATE);
+    let proof = SigningProof::WebAuthnAssertionProof(vec![]);
+
+    let outcome = driver
+        .continue_after_resolved(&gate, &proof)
+        .await
+        .expect("confirmed submission succeeds");
+    assert_eq!(outcome.ledger_state, SigningLedgerState::BroadcastSubmitted);
+    assert_eq!(
+        outcome.broadcast,
+        ironclaw_attested_runtime::BroadcastDisposition::Submitted {
+            tx_id: "recorded-tx".to_string()
+        }
+    );
+    assert_eq!(broadcaster.count(), 1);
     assert_eq!(
         ledger.state(&gate).await.unwrap(),
         SigningLedgerState::BroadcastSubmitted
