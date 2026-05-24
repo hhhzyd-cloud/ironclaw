@@ -137,12 +137,25 @@ pub struct NearRedirectSigningProvider {
     callback_url: String,
     state_secret: Vec<u8>,
     grants: Arc<dyn SealedGrantStore>,
+    /// The ed25519 access-key public key (32 bytes) the gate expects the wallet
+    /// to sign with, bound at gate-raise time and carried through the gate
+    /// record by PR10. The signature is verified against THIS key, never against
+    /// the callback-supplied key. `None` means the binding is not available in
+    /// the gate context — verification then fails closed (a callback-declared key
+    /// is never accepted as identity). See `verify_resume`.
+    expected_access_key: Option<Vec<u8>>,
 }
 
 impl NearRedirectSigningProvider {
     /// Construct over the wallet redirect/callback URLs, a server-side
     /// `state_secret` (used to MAC-bind the `state` parameter to the gate), and
     /// a sealed-grant store.
+    ///
+    /// This constructor leaves the expected access-key public key unbound
+    /// (`None`). A provider built this way fails closed on `verify_resume`
+    /// (`ProofInvalid`) because it has no authoritative key to verify the
+    /// callback signature against. Use [`Self::with_expected_access_key`] once
+    /// the gate record supplies the bound key (PR10).
     pub fn new(
         wallet_base_url: impl Into<String>,
         callback_url: impl Into<String>,
@@ -154,6 +167,31 @@ impl NearRedirectSigningProvider {
             callback_url: callback_url.into(),
             state_secret: state_secret.into(),
             grants,
+            expected_access_key: None,
+        }
+    }
+
+    /// Construct with the gate-bound expected access-key public key (32 bytes).
+    ///
+    /// The signature on the resume proof is verified against `expected_access_key`
+    /// — the key bound when the gate was raised — and the callback-supplied
+    /// public key is only accepted if it is byte-equal to it. This proves the
+    /// signer is the access key bound to the gate (and therefore to the bound
+    /// NEAR account), closing the threat-#4 hole where an attacker supplied their
+    /// own keypair plus a bound `account_id` string.
+    pub fn with_expected_access_key(
+        wallet_base_url: impl Into<String>,
+        callback_url: impl Into<String>,
+        state_secret: impl Into<Vec<u8>>,
+        grants: Arc<dyn SealedGrantStore>,
+        expected_access_key: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            wallet_base_url: wallet_base_url.into(),
+            callback_url: callback_url.into(),
+            state_secret: state_secret.into(),
+            grants,
+            expected_access_key: Some(expected_access_key.into()),
         }
     }
 
@@ -258,18 +296,46 @@ impl SigningProvider for NearRedirectSigningProvider {
 
         // 4. Signer binding (threat #4) + signed-bytes binding (threat #2):
         //    verify the ed25519 signature over the bound 32 hash bytes against
-        //    the declared access-key public key. Because the signed message *is*
-        //    the approved canonical hash, a valid signature proves the wallet
-        //    signed exactly the approved bytes.
+        //    the GATE-BOUND access-key public key — never the callback-supplied
+        //    `payload.public_key`. The callback-declared key is not an identity:
+        //    an attacker can supply their own keypair plus the bound account_id
+        //    string and pass an account-string compare, so identity must come
+        //    from the key bound when the gate was raised.
+        //
+        //    If the gate context did not carry the expected access key
+        //    (`expected_access_key == None`), there is nothing authoritative to
+        //    verify against, so we FAIL CLOSED rather than trust the
+        //    callback-declared key.
+        let Some(expected_key) = self.expected_access_key.as_deref() else {
+            return Err(SigningProviderError::ProofInvalid {
+                reason: "no gate-bound NEAR access key available to verify the proof against; \
+                         refusing to trust the callback-supplied public key"
+                    .to_string(),
+            });
+        };
+        // The callback-supplied key must be byte-equal to the bound key; anything
+        // else is a signer substitution attempt and fails closed.
+        if payload.public_key.as_slice() != expected_key {
+            return Err(SigningProviderError::SignerMismatch);
+        }
+        // Because the signed message *is* the approved canonical hash, a valid
+        // signature against the BOUND key proves the bound access key signed
+        // exactly the approved bytes.
         verify::verify_signature_over_hash(
             approved_tx_hash.as_bytes(),
             &payload.signature,
-            &payload.public_key,
+            expected_key,
         )?;
 
         // 5. Access-key scope (threat #22): the declared scope must cover the
-        //    bound operation. A function-call key restricted to a different
-        //    receiver / method cannot authorize this transaction.
+        //    bound operation. The scope is NEVER taken on the callback's word —
+        //    a `FunctionCall` key would have to be cross-checked against the
+        //    receiver/method decoded from the bound transaction, which is not
+        //    recoverable at this resume boundary on this branch (the provider
+        //    only holds the opaque approved-tx hash, not the structured decode).
+        //    We therefore FAIL CLOSED for `FunctionCall` rather than accept a
+        //    callback-declared scope; `FullAccess` is explicit and bound (it
+        //    authorizes any action on the bound account).
         let bound_op = decode_bound_operation(context, approved_tx_hash);
         validate_access_key_scope(&payload.access_key_scope, &bound_op)?;
 
@@ -284,21 +350,24 @@ impl SigningProvider for NearRedirectSigningProvider {
 
 /// Recompute the bound NEAR operation from authoritative context.
 ///
-/// PR6 deferred the full `near-primitives` borsh `Transaction` decode, so the
-/// per-action receiver/method are not yet recoverable from the transaction bytes
-/// at this layer. Until that decode lands, the bound operation is treated as
-/// unconstrained (`None`/`None`): a `FullAccess` key always passes, and a
-/// `FunctionCall` key is accepted as long as it is internally well-formed (the
-/// scope still cannot be *escalated* beyond what the wallet declares). The
-/// receiver/method cross-check against the decoded transaction is wired once the
-/// borsh decode follow-up lands.
+/// The per-action receiver/method are not recoverable at this resume boundary on
+/// this branch: `verify_resume` only holds the opaque `ApprovedTxHash` (32 bytes)
+/// and the `SigningContext`, not the structured transaction decode. PR2 was
+/// reworked to provide a full NEAR transaction decode
+/// (`ironclaw_attestation::{NearTransaction, NearAction}`), but that decoded form
+/// is produced at `initiate` from the `DecodedTransaction`, not carried into
+/// resume here, so it is not reachable without the PR10 gate-record plumbing.
+/// The bound operation is therefore returned unconstrained (`None`/`None`); the
+/// scope validator FAILS CLOSED for `FunctionCall` rather than accepting a
+/// callback-declared receiver/method.
 fn decode_bound_operation(
     _context: &SigningContext,
     _approved_tx_hash: &ApprovedTxHash,
 ) -> NearBoundOperation {
-    // PR-followup(near-borsh): recover receiver_id/method_name from the decoded
-    // borsh Transaction once the heavy-SDK-free decode lands, and cross-check
-    // them against the FunctionCall scope below.
+    // rebase: cross-check receiver/method via PR2 decode — once the gate record
+    // carries the decoded `NearTransaction` into resume (PR10), recover
+    // receiver_id/method_name here and cross-check them against the FunctionCall
+    // scope below instead of failing closed.
     NearBoundOperation {
         receiver_id: None,
         method_name: None,
@@ -307,12 +376,19 @@ fn decode_bound_operation(
 
 /// Validate that the declared access-key scope covers the bound operation
 /// (threat #22).
+///
+/// The scope is never trusted on the callback's word. `FullAccess` is explicit
+/// and bound (authorizes any action on the bound account). `FunctionCall` FAILS
+/// CLOSED whenever the bound receiver/method are not available to cross-check
+/// against — accepting a callback-declared receiver/method would let an attacker
+/// scope a narrow key to whatever they please. The cross-check is only performed
+/// (and the scope only accepted) when the bound operation is known.
 fn validate_access_key_scope(
     scope: &NearAccessKeyScope,
     bound: &NearBoundOperation,
 ) -> Result<(), SigningProviderError> {
     match scope {
-        // A full-access key authorizes any action on the account.
+        // A full-access key authorizes any action on the bound account.
         NearAccessKeyScope::FullAccess => Ok(()),
         NearAccessKeyScope::FunctionCall {
             receiver_id,
@@ -323,13 +399,20 @@ fn validate_access_key_scope(
                     reason: "function-call access key declares an empty receiver".to_string(),
                 });
             }
-            // If the bound operation's receiver/method are known (post borsh
-            // decode), require the key to cover them. Until then they are `None`
-            // and we only enforce internal well-formedness — the scope can never
-            // be widened beyond what the wallet declares.
-            if let Some(bound_receiver) = &bound.receiver_id
-                && receiver_id != bound_receiver
-            {
+            // FAIL CLOSED: without the bound receiver decoded from the
+            // transaction we cannot prove the callback-declared scope actually
+            // covers the bound operation, and a callback-declared scope is never
+            // accepted on trust. (Lifted once PR10 carries the decoded
+            // NearTransaction into resume — see `decode_bound_operation`.)
+            let Some(bound_receiver) = &bound.receiver_id else {
+                return Err(SigningProviderError::ScopeViolation {
+                    reason: "bound NEAR operation is not available to cross-check the \
+                             function-call access-key scope against; refusing to trust the \
+                             callback-declared scope"
+                        .to_string(),
+                });
+            };
+            if receiver_id != bound_receiver {
                 return Err(SigningProviderError::ScopeViolation {
                     reason: format!(
                         "access key receiver `{receiver_id}` does not match bound receiver \
@@ -337,6 +420,9 @@ fn validate_access_key_scope(
                     ),
                 });
             }
+            // The bound method must be covered by the key's method list. An empty
+            // method list means "any method on `receiver_id`" (NEAR convention),
+            // which a known, matching receiver makes safe.
             if let Some(bound_method) = &bound.method_name
                 && !method_names.is_empty()
                 && !method_names.iter().any(|m| m == bound_method)
@@ -415,13 +501,30 @@ mod hex_bytes {
 
     pub(super) fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
         let s = s.strip_prefix("0x").unwrap_or(s);
-        if !s.len().is_multiple_of(2) {
+        // Decode over bytes, never `&str` slices: byte-offset `&s[i..i+2]`
+        // slicing panics on non-ASCII even-length input (a callback DoS).
+        let bytes = s.as_bytes();
+        if !bytes.len().is_multiple_of(2) {
             return Err("odd-length hex".to_string());
         }
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
-            .collect()
+        let mut out = Vec::with_capacity(bytes.len() / 2);
+        for pair in bytes.chunks_exact(2) {
+            let hi = hex_nibble(pair[0])?;
+            let lo = hex_nibble(pair[1])?;
+            out.push((hi << 4) | lo);
+        }
+        Ok(out)
+    }
+
+    /// Decode a single ASCII hex digit to its 4-bit value, rejecting anything
+    /// else (including non-ASCII bytes) without panicking.
+    fn hex_nibble(b: u8) -> Result<u8, String> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            other => Err(format!("invalid hex digit: 0x{other:02x}")),
+        }
     }
 }
 
@@ -495,6 +598,21 @@ mod tests {
     fn url_encode_escapes_reserved_and_keeps_unreserved() {
         assert_eq!(url_encode("a-b_c.d~e"), "a-b_c.d~e");
         assert_eq!(url_encode("a b&c=d"), "a%20b%26c%3Dd");
+    }
+
+    #[test]
+    fn hex_decode_rejects_non_ascii_without_panic() {
+        // `é` is a 2-byte UTF-8 sequence, so the input byte length is even — the
+        // old `&s[i..i+2]` `&str` slicing would panic on this. The hardened
+        // byte-based decoder must return an error instead.
+        assert!(hex_bytes::hex_decode("éé").is_err());
+        assert!(hex_bytes::hex_decode("0011éé").is_err());
+        // Odd-length still rejected; valid hex still round-trips.
+        assert!(hex_bytes::hex_decode("abc").is_err());
+        assert_eq!(
+            hex_bytes::hex_decode("0xdeadBEEF").expect("hex"),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
     }
 
     #[test]

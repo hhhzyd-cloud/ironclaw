@@ -330,17 +330,33 @@ pub(crate) async fn chat_gate_resolve_handler(
             "Invalid request_id (expected UUID)".to_string(),
         )
     })?;
+    // External-wallet proof resolutions (`InjectedWalletProof` /
+    // `NearRedirectProof`) are pre-classified `Approved`, but a proof that fails
+    // verification (malformed / unverified / unbound) must NOT create an
+    // `Approved` mission outcome. For those arms the mission resume is gated on
+    // the resolution SUCCEEDING — see `proof_resume` below — so the failure path
+    // is inert w.r.t. mission/gate state. The non-proof arms keep their
+    // unconditional outcome (their handlers `?`-propagate failures before the
+    // resume hook runs, or are inherently terminal).
     let mission_outcome = match req.resolution {
         GateResolutionPayload::Approved { .. }
-        | GateResolutionPayload::CredentialProvided { .. }
-        | GateResolutionPayload::InjectedWalletProof { .. }
-        | GateResolutionPayload::NearRedirectProof { .. } => {
+        | GateResolutionPayload::CredentialProvided { .. } => {
             Some(ironclaw_engine::GateResolutionOutcome::Approved)
         }
         GateResolutionPayload::Denied => Some(ironclaw_engine::GateResolutionOutcome::Denied),
         GateResolutionPayload::Cancelled => Some(ironclaw_engine::GateResolutionOutcome::Cancelled),
+        // Proof arms: resume only on success, handled below.
+        GateResolutionPayload::InjectedWalletProof { .. }
+        | GateResolutionPayload::NearRedirectProof { .. } => None,
     };
     let mission_resume = mission_outcome.map(|outcome| (outcome, gate_request_id));
+    // Whether this resolution is an external-wallet proof path, whose mission
+    // resume must be gated on the proof resolution succeeding.
+    let is_proof_resolution = matches!(
+        req.resolution,
+        GateResolutionPayload::InjectedWalletProof { .. }
+            | GateResolutionPayload::NearRedirectProof { .. }
+    );
 
     let response: Result<Json<ActionResponse>, (StatusCode, String)> = match req.resolution {
         GateResolutionPayload::Approved { always } => {
@@ -481,11 +497,27 @@ pub(crate) async fn chat_gate_resolve_handler(
         }
     };
 
+    // Non-proof arms: fire the precomputed mission resume (unchanged).
     if let Some((outcome, gate_request_id)) = mission_resume {
         let _ = crate::bridge::resume_paused_missions_for_gate_request(
             &user.user_id,
             gate_request_id,
             outcome,
+        )
+        .await;
+    }
+
+    // Proof arms (injected / NEAR redirect): resume the paused mission ONLY when
+    // the proof resolution SUCCEEDED. A failed / malformed / unverified proof
+    // (handler returned `Err`) must be inert w.r.t. mission/gate state — it must
+    // never create an `Approved` mission outcome. This mirrors the sibling
+    // injected-proof invariant: the failure path does not bypass verification to
+    // mutate state.
+    if is_proof_resolution && response.is_ok() {
+        let _ = crate::bridge::resume_paused_missions_for_gate_request(
+            &user.user_id,
+            gate_request_id,
+            ironclaw_engine::GateResolutionOutcome::Approved,
         )
         .await;
     }
@@ -3349,6 +3381,79 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_chat_gate_resolve_near_redirect_failed_proof_does_not_resume_mission() {
+        // Regression (PR8 review, finding #1): a NEAR redirect proof that fails
+        // resolution (503 without composition, or 400 malformed) must be inert
+        // w.r.t. mission/gate state — it must NOT drive an `Approved` mission
+        // auto-resume. The proof arm's mission resume is gated on
+        // `response.is_ok()`, so a failure-status response leaves the resume
+        // hook un-fired. (The `resume_paused_missions_for_gate_request` call is a
+        // no-op here because `ENGINE_STATE` is unset in the harness, so the
+        // observable guarantee under test is the fail-closed status + the
+        // success-gated control flow that precedes the resume call.)
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        // Case A: no composition wired -> 503, must not resume.
+        for (label, approved_tx_hash, expected) in [
+            (
+                "unverified-503",
+                "07".repeat(32),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            ("malformed-400", "07".repeat(16), StatusCode::BAD_REQUEST),
+        ] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let state = test_gateway_state(None);
+            *state.msg_tx.write().await = Some(tx);
+            assert!(
+                state.attested_grant_store.is_none(),
+                "{label}: PR8 default state has no attested grant store"
+            );
+
+            let app = Router::new()
+                .route("/api/chat/gate/resolve", post(chat_gate_resolve_handler))
+                .with_state(state);
+
+            let request_id = Uuid::new_v4();
+            let mut req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/chat/gate/resolve")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "request_id": request_id,
+                        "thread_id": "gateway-thread-near",
+                        "resolution": "near_redirect_proof",
+                        "account_id": "alice.near",
+                        "public_key": "11".repeat(32),
+                        "signature": "00".repeat(64),
+                        "approved_tx_hash": approved_tx_hash,
+                        "access_key_scope": { "kind": "full_access" },
+                        "state": "deadbeef",
+                    })
+                    .to_string(),
+                ))
+                .expect("request");
+            req.extensions_mut().insert(UserIdentity {
+                user_id: "member-1".to_string(),
+                role: "member".to_string(),
+                workspace_read_scopes: Vec::new(),
+            });
+
+            let resp = ServiceExt::<axum::http::Request<Body>>::oneshot(app, req)
+                .await
+                .unwrap_or_else(|_| panic!("{label}: response"));
+            assert_eq!(resp.status(), expected, "{label}: must fail closed");
+            // A failed proof never forwards an engine submission either.
+            assert!(
+                rx.try_recv().is_err(),
+                "{label}: failed proof must not forward a submission"
+            );
+        }
     }
 
     #[tokio::test]

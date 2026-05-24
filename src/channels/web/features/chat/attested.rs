@@ -264,12 +264,21 @@ pub(crate) async fn verify_near_redirect_proof(
     wallet_base_url: &str,
     callback_url: &str,
     state_secret: &[u8],
+    expected_access_key: &[u8],
     context: &SigningContext,
     approved_tx_hash: &ApprovedTxHash,
     proof: &SigningProof,
 ) -> Result<(), SigningProviderError> {
-    let provider =
-        NearRedirectSigningProvider::new(wallet_base_url, callback_url, state_secret, grants);
+    // The expected ed25519 access-key public key is the gate-bound identity
+    // (carried from the gate record by PR10). The signature is verified against
+    // THIS key, never the callback-supplied key.
+    let provider = NearRedirectSigningProvider::with_expected_access_key(
+        wallet_base_url,
+        callback_url,
+        state_secret,
+        grants,
+        expected_access_key.to_vec(),
+    );
     provider
         .verify_resume(context, approved_tx_hash, proof)
         .await
@@ -315,11 +324,21 @@ pub(crate) async fn resolve_near_redirect_proof(
     };
 
     // PR10: with `_grants` present, look up the persisted `BlockedAttested` gate
-    // for `_gate_request_id`, recover its bound `SigningContext` +
-    // `ApprovedTxHash` + the `state_secret`/wallet URLs, call
-    // `verify_near_redirect_proof(...)`, and on success build `ResumeTurnRequest
-    // { attestation: Some(..) }` + dispatch the broadcast through the existing
-    // gate-resolve engine submission path. Not built in PR8.
+    // for `_gate_request_id` and recover ALL authoritative inputs from the gate
+    // record — never from caller-supplied wire fields:
+    //   * `SigningContext` (tenant/user/run/gate/chain/account),
+    //   * the bound `ApprovedTxHash` (NOT the caller-supplied `approved_tx_hash`;
+    //     the wire value is only re-checked against the bound hash, never trusted
+    //     as authority),
+    //   * the server-side `state_secret` + wallet/callback URLs used at
+    //     `initiate`,
+    //   * the gate-bound expected NEAR access-key public key (the identity the
+    //     signature is verified against — `verify_near_redirect_proof` now takes
+    //     it as a required argument; it must come from the gate record, never the
+    //     callback `public_key`).
+    // Then call `verify_near_redirect_proof(...)`, and on success build
+    // `ResumeTurnRequest { attestation: Some(..) }` + dispatch the broadcast
+    // through the existing gate-resolve engine submission path. Not built in PR8.
     Err((
         StatusCode::SERVICE_UNAVAILABLE,
         "Attested external-wallet signing resume is not yet wired (pending PR10).".to_string(),
@@ -344,15 +363,34 @@ fn parse_hash(s: &str) -> Result<ApprovedTxHash, (StatusCode, String)> {
 }
 
 /// Decode a hex string (optionally `0x`-prefixed) to bytes.
+///
+/// Decodes over bytes, never `&str` slices: byte-offset `&s[i..i+2]` slicing
+/// panics on non-ASCII even-length input, which is attacker-controllable on the
+/// callback fields (a DoS). Any non-hex (incl. non-ASCII) byte is rejected.
 fn parse_hex(s: &str) -> Result<Vec<u8>, String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    if !s.len().is_multiple_of(2) {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return Err("odd-length hex".to_string());
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
-        .collect()
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let hi = hex_nibble(pair[0])?;
+        let lo = hex_nibble(pair[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+/// Decode a single ASCII hex digit to its 4-bit value, rejecting anything else
+/// (including non-ASCII bytes) without panicking.
+fn hex_nibble(b: u8) -> Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        other => Err(format!("invalid hex digit: 0x{other:02x}")),
+    }
 }
 
 #[cfg(test)]
@@ -541,6 +579,7 @@ mod tests {
             NEAR_WALLET_URL,
             NEAR_CALLBACK_URL,
             NEAR_STATE_SECRET,
+            &pubkey,
             &context,
             &hash,
             &proof,
@@ -554,6 +593,7 @@ mod tests {
             NEAR_WALLET_URL,
             NEAR_CALLBACK_URL,
             NEAR_STATE_SECRET,
+            &pubkey,
             &context,
             &hash,
             &proof,
@@ -594,6 +634,7 @@ mod tests {
             NEAR_WALLET_URL,
             NEAR_CALLBACK_URL,
             NEAR_STATE_SECRET,
+            &pubkey,
             &context,
             &hash,
             &proof,
@@ -601,5 +642,47 @@ mod tests {
         .await
         .expect_err("wrong account must reject");
         assert!(matches!(err, SigningProviderError::SignerMismatch));
+    }
+
+    #[test]
+    fn near_proof_from_input_rejects_non_ascii_hex() {
+        // Non-ASCII even-length input must reject cleanly (no panic) on every
+        // hex-decoded callback field. `é` is a 2-byte UTF-8 sequence, so the
+        // string byte length is even — the old `&s[i..i+2]` slicing would panic.
+        for field in ["public_key", "signature", "approved_tx_hash", "state"] {
+            let mut input = NearRedirectProofInput {
+                account_id: "alice.near".into(),
+                public_key: "11".repeat(32),
+                signature: "00".repeat(64),
+                approved_tx_hash: "00".repeat(32),
+                access_key_scope: NearAccessKeyScopeInput::FullAccess,
+                state: "deadbeef".into(),
+            };
+            match field {
+                "public_key" => input.public_key = "éé".into(),
+                "signature" => input.signature = "éé".into(),
+                "approved_tx_hash" => input.approved_tx_hash = "éé".into(),
+                _ => {}
+            }
+            // `state` is not hex-decoded in the handler (it is echoed verbatim
+            // and compared after re-derivation), so only the hex fields reject.
+            if field == "state" {
+                // Sanity: a non-hex state still parses (it is opaque here).
+                assert!(near_proof_from_input(&input).is_ok());
+                continue;
+            }
+            let err = near_proof_from_input(&input)
+                .expect_err("non-ascii hex must reject without panicking");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn parse_hex_rejects_non_ascii_without_panic() {
+        // Direct regression on the hardened decoder: even-byte-length non-ASCII
+        // input must return an error, never panic on a `&str` byte slice.
+        assert!(parse_hex("éé").is_err());
+        assert!(parse_hex("0011éé").is_err());
+        assert!(parse_hash("éé".repeat(16).as_str()).is_err());
     }
 }

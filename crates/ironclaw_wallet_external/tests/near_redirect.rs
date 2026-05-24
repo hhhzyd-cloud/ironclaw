@@ -50,8 +50,26 @@ fn ctx_for(account: &str) -> SigningContext {
     }
 }
 
+/// A provider with NO gate-bound access key. Used to assert the fail-closed
+/// path (a NEAR redirect proof cannot be verified without an authoritative
+/// bound key — the callback-supplied key is never trusted as identity).
 fn provider(store: Arc<InMemorySealedGrantStore>) -> NearRedirectSigningProvider {
     NearRedirectSigningProvider::new(WALLET_URL, CALLBACK_URL, STATE_SECRET, store)
+}
+
+/// A provider bound to `expected_key`'s public key, as PR10 will construct it
+/// from the gate record. The signature is verified against THIS key.
+fn provider_bound(
+    store: Arc<InMemorySealedGrantStore>,
+    expected_key: &EdSigningKey,
+) -> NearRedirectSigningProvider {
+    NearRedirectSigningProvider::with_expected_access_key(
+        WALLET_URL,
+        CALLBACK_URL,
+        STATE_SECRET,
+        store,
+        expected_key.verifying_key().to_bytes().to_vec(),
+    )
 }
 
 async fn seal_grant(store: &InMemorySealedGrantStore, ctx: &SigningContext, hash: ApprovedTxHash) {
@@ -110,8 +128,8 @@ async fn initiate_returns_redirect_directive_with_state_and_callback() {
 #[tokio::test]
 async fn valid_signature_from_bound_account_verifies() {
     let store = Arc::new(InMemorySealedGrantStore::new());
-    let p: Arc<dyn SigningProvider> = Arc::new(provider(store.clone()));
     let key = near_key();
+    let p: Arc<dyn SigningProvider> = Arc::new(provider_bound(store.clone(), &key));
     let account = "alice.near";
     let ctx = ctx_for(account);
     let hash = ApprovedTxHash::from_bytes([7u8; 32]);
@@ -123,6 +141,84 @@ async fn valid_signature_from_bound_account_verifies() {
         .await
         .expect("valid near proof must verify");
     assert_eq!(verified.proof(), &proof);
+}
+
+#[tokio::test]
+async fn unbound_access_key_fails_closed() {
+    // A provider with no gate-bound access key must refuse to verify a NEAR
+    // redirect proof: the callback-supplied public key is never trusted as
+    // identity. Even an otherwise-valid proof fails closed (`ProofInvalid`).
+    let store = Arc::new(InMemorySealedGrantStore::new());
+    let p = provider(store.clone());
+    let key = near_key();
+    let account = "alice.near";
+    let ctx = ctx_for(account);
+    let hash = ApprovedTxHash::from_bytes([7u8; 32]);
+    seal_grant(&store, &ctx, hash).await;
+
+    let proof = valid_proof(&key, account, &ctx, hash, NearAccessKeyScope::FullAccess);
+    let err = p
+        .verify_resume(&ctx, &hash, &proof)
+        .await
+        .expect_err("unbound access key must fail closed");
+    assert!(matches!(err, SigningProviderError::ProofInvalid { .. }));
+}
+
+#[tokio::test]
+async fn callback_supplied_key_substitution_is_signer_mismatch() {
+    // The gate is bound to `bound_key`, but the attacker signs with and declares
+    // their own `attacker_key`. The account_id string still matches the bound
+    // account. This must fail closed as a signer mismatch — proving the
+    // callback-declared key is not accepted as identity (threat #4).
+    let store = Arc::new(InMemorySealedGrantStore::new());
+    let bound_key = EdSigningKey::from_bytes(&[0x11u8; 32]);
+    let attacker_key = EdSigningKey::from_bytes(&[0x99u8; 32]);
+    let p = provider_bound(store.clone(), &bound_key);
+    let account = "alice.near";
+    let ctx = ctx_for(account);
+    let hash = ApprovedTxHash::from_bytes([7u8; 32]);
+    seal_grant(&store, &ctx, hash).await;
+
+    // Proof signed by the attacker's key, declaring the attacker's pubkey, but
+    // claiming the bound account.
+    let proof = valid_proof(
+        &attacker_key,
+        account,
+        &ctx,
+        hash,
+        NearAccessKeyScope::FullAccess,
+    );
+    let err = p
+        .verify_resume(&ctx, &hash, &proof)
+        .await
+        .expect_err("callback-supplied key substitution must fail closed");
+    assert!(matches!(err, SigningProviderError::SignerMismatch));
+}
+
+#[tokio::test]
+async fn function_call_scope_fails_closed_without_bound_operation() {
+    // A function-call scope cannot be cross-checked against the bound operation
+    // at this resume boundary (the structured decode is not carried into
+    // resume), so a callback-declared function-call scope must fail closed
+    // rather than be accepted on trust (threat #22).
+    let store = Arc::new(InMemorySealedGrantStore::new());
+    let key = near_key();
+    let p = provider_bound(store.clone(), &key);
+    let account = "alice.near";
+    let ctx = ctx_for(account);
+    let hash = ApprovedTxHash::from_bytes([7u8; 32]);
+    seal_grant(&store, &ctx, hash).await;
+
+    let scope = NearAccessKeyScope::FunctionCall {
+        receiver_id: "contract.near".to_string(),
+        method_names: vec!["ft_transfer".to_string()],
+    };
+    let proof = valid_proof(&key, account, &ctx, hash, scope);
+    let err = p
+        .verify_resume(&ctx, &hash, &proof)
+        .await
+        .expect_err("unverifiable function-call scope must fail closed");
+    assert!(matches!(err, SigningProviderError::ScopeViolation { .. }));
 }
 
 #[tokio::test]
@@ -209,8 +305,8 @@ async fn mismatched_state_is_proof_invalid() {
 #[tokio::test]
 async fn bad_signature_is_proof_invalid() {
     let store = Arc::new(InMemorySealedGrantStore::new());
-    let p = provider(store.clone());
     let key = near_key();
+    let p = provider_bound(store.clone(), &key);
     let account = "alice.near";
     let ctx = ctx_for(account);
     let hash = ApprovedTxHash::from_bytes([7u8; 32]);
@@ -237,8 +333,8 @@ async fn bad_signature_is_proof_invalid() {
 #[tokio::test]
 async fn empty_receiver_function_call_scope_is_scope_violation() {
     let store = Arc::new(InMemorySealedGrantStore::new());
-    let p = provider(store.clone());
     let key = near_key();
+    let p = provider_bound(store.clone(), &key);
     let account = "alice.near";
     let ctx = ctx_for(account);
     let hash = ApprovedTxHash::from_bytes([7u8; 32]);
@@ -259,8 +355,8 @@ async fn empty_receiver_function_call_scope_is_scope_violation() {
 #[tokio::test]
 async fn replay_after_claim_fails_closed() {
     let store = Arc::new(InMemorySealedGrantStore::new());
-    let p = provider(store.clone());
     let key = near_key();
+    let p = provider_bound(store.clone(), &key);
     let account = "alice.near";
     let ctx = ctx_for(account);
     let hash = ApprovedTxHash::from_bytes([7u8; 32]);
@@ -280,8 +376,8 @@ async fn replay_after_claim_fails_closed() {
 #[tokio::test]
 async fn unsealed_grant_fails_closed() {
     let store = Arc::new(InMemorySealedGrantStore::new());
-    let p = provider(store.clone());
     let key = near_key();
+    let p = provider_bound(store.clone(), &key);
     let account = "alice.near";
     let ctx = ctx_for(account);
     let hash = ApprovedTxHash::from_bytes([7u8; 32]);
