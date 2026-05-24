@@ -591,7 +591,19 @@ impl TurnStateStore for InMemoryTurnStateStore {
             key: request.idempotency_key.clone(),
         };
         if let Some(result) = inner.resume_idempotency.get(&idempotency_key) {
-            return result.clone();
+            // Idempotency-cache hit: this is a same-key *replay* of a resume
+            // that already executed. Mark the returned success as `replayed` so
+            // the reborn signer-continuation layer can distinguish it from the
+            // original fresh transition and never fire the one-shot external
+            // signer twice for one attested gate. The cached/persisted record
+            // itself keeps the canonical fresh value (`replayed = false`).
+            return match result {
+                Ok(response) => Ok(ResumeTurnResponse {
+                    replayed: true,
+                    ..response.clone()
+                }),
+                Err(error) => Err(error.clone()),
+            };
         }
         let result = inner.resume_turn_once(&request, self.attested_resume_port.as_deref());
         inner.remember_resume_idempotency(idempotency_key, result.clone(), Utc::now());
@@ -1320,6 +1332,7 @@ impl Inner {
             run_id: record.run_id,
             status: record.status,
             event_cursor: record.event_cursor,
+            replayed: false,
         };
         self.push_event(record, TurnEventKind::Resumed, None);
         Ok(response)
@@ -1376,6 +1389,7 @@ impl Inner {
             run_id: record.run_id,
             status: record.status,
             event_cursor: record.event_cursor,
+            replayed: false,
         };
         self.push_event(record, TurnEventKind::Resumed, None);
         Ok(response)

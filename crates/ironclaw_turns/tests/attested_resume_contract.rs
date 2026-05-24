@@ -223,6 +223,199 @@ async fn attested_resume_without_configured_port_fails_closed() {
     );
 }
 
+// ---- replay safety: signer continuation fires at most once -----------------
+
+#[tokio::test]
+async fn attested_resume_same_key_retry_is_marked_replayed() {
+    // A duplicate resume with the SAME idempotency key must return the cached
+    // success flagged `replayed = true`, so the reborn signer-continuation
+    // layer can tell it apart from the original fresh transition and never fire
+    // the external signer twice for one gate.
+    let port = Arc::new(MockAttestedResumePort::accepting());
+    let store = Arc::new(InMemoryTurnStateStore::default().with_attested_resume_port(port.clone()));
+    let (run_id, scope) = submit_and_block_attested(&store, "thread-attested-retry").await;
+
+    let request = attested_resume(&scope, run_id, Some("claim-good"));
+
+    let first = store.resume_turn(request.clone()).await.unwrap();
+    assert_eq!(first.status, TurnStatus::AttestedResolved);
+    assert!(!first.replayed, "first resume is a fresh transition");
+
+    // Same idempotency key → cached replay.
+    let second = store.resume_turn(request).await.unwrap();
+    assert_eq!(second.status, TurnStatus::AttestedResolved);
+    assert!(second.replayed, "same-key retry must be marked replayed");
+    assert_eq!(second.run_id, first.run_id);
+    assert_eq!(second.event_cursor, first.event_cursor);
+
+    // The verifier port was consulted exactly once (the fresh transition); the
+    // replay short-circuits before any verification.
+    assert_eq!(
+        port.calls().len(),
+        1,
+        "replay must not re-invoke the verifier"
+    );
+}
+
+#[tokio::test]
+async fn attested_resume_new_key_double_resume_is_rejected() {
+    // A second resume with a DIFFERENT idempotency key is a fresh transition
+    // attempt against an already-resolved gate; the run is `AttestedResolved`,
+    // which is non-resumable, so it fails closed without touching the port.
+    let port = Arc::new(MockAttestedResumePort::accepting());
+    let store = Arc::new(InMemoryTurnStateStore::default().with_attested_resume_port(port.clone()));
+    let (run_id, scope) = submit_and_block_attested(&store, "thread-attested-double").await;
+
+    let first = store
+        .resume_turn(attested_resume(&scope, run_id, Some("claim-good")))
+        .await
+        .unwrap();
+    assert_eq!(first.status, TurnStatus::AttestedResolved);
+    assert!(!first.replayed);
+
+    // Fresh key → not an idempotency replay; runs flat checks and is rejected
+    // because AttestedResolved is non-resumable.
+    let mut second_request = attested_resume(&scope, run_id, Some("claim-good"));
+    second_request.idempotency_key = IdempotencyKey::new("idem-resume-attested-double-2").unwrap();
+    let err = store.resume_turn(second_request).await.unwrap_err();
+    assert!(matches!(
+        err,
+        ironclaw_turns::TurnError::InvalidTransition { .. }
+    ));
+
+    // Port consulted exactly once total; the second attempt never reached it.
+    assert_eq!(port.calls().len(), 1);
+    assert_eq!(
+        run_status(&store, &scope, run_id).await,
+        TurnStatus::AttestedResolved
+    );
+}
+
+#[tokio::test]
+async fn attested_resume_missing_persisted_hash_fails_closed() {
+    // A run in `BlockedAttested` whose persisted `expected_tx_hash` binding is
+    // absent is a store-invariant violation (e.g. a corrupted snapshot). Resume
+    // must fail closed (Conflict) without consulting the port, leaving the run
+    // blocked rather than resolving it.
+    let port = Arc::new(MockAttestedResumePort::accepting());
+    let store = Arc::new(InMemoryTurnStateStore::default().with_attested_resume_port(port.clone()));
+    let (run_id, scope) = submit_and_block_attested(&store, "thread-attested-missing-hash").await;
+
+    // Drop the persisted binding via a snapshot round-trip, then rebuild a store
+    // carrying the port.
+    let mut snapshot = store.persistence_snapshot();
+    for run in &mut snapshot.runs {
+        if run.run_id == run_id {
+            assert_eq!(run.status, TurnStatus::BlockedAttested);
+            run.expected_tx_hash = None;
+        }
+    }
+    let store = Arc::new(
+        InMemoryTurnStateStore::from_persistence_snapshot(
+            snapshot,
+            ironclaw_turns::InMemoryTurnStateStoreLimits::default(),
+        )
+        .unwrap()
+        .with_attested_resume_port(port.clone()),
+    );
+
+    let err = store
+        .resume_turn(attested_resume(&scope, run_id, Some("claim-good")))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ironclaw_turns::TurnError::Conflict { .. }));
+    assert!(
+        port.calls().is_empty(),
+        "missing binding must not reach the port"
+    );
+    assert_eq!(
+        run_status(&store, &scope, run_id).await,
+        TurnStatus::BlockedAttested
+    );
+}
+
+// ---- recommended: wrong actor/scope/gate must NOT call the port ------------
+
+#[tokio::test]
+async fn attested_resume_wrong_actor_does_not_call_port() {
+    let port = Arc::new(MockAttestedResumePort::accepting());
+    let store = Arc::new(InMemoryTurnStateStore::default().with_attested_resume_port(port.clone()));
+    let (run_id, scope) = submit_and_block_attested(&store, "thread-attested-wrong-actor").await;
+
+    let mut request = attested_resume(&scope, run_id, Some("claim-good"));
+    request.actor = TurnActor::new(UserId::new("intruder").unwrap());
+    let err = store.resume_turn(request).await.unwrap_err();
+    assert!(matches!(err, ironclaw_turns::TurnError::Unauthorized));
+    assert!(port.calls().is_empty(), "wrong actor must not reach port");
+    assert_eq!(
+        run_status(&store, &scope, run_id).await,
+        TurnStatus::BlockedAttested
+    );
+}
+
+#[tokio::test]
+async fn attested_resume_wrong_scope_does_not_call_port() {
+    let port = Arc::new(MockAttestedResumePort::accepting());
+    let store = Arc::new(InMemoryTurnStateStore::default().with_attested_resume_port(port.clone()));
+    let (run_id, scope) = submit_and_block_attested(&store, "thread-attested-wrong-scope").await;
+
+    let mut request = attested_resume(&scope, run_id, Some("claim-good"));
+    request.scope = scope_other("thread-attested-wrong-scope-other");
+    let err = store.resume_turn(request).await.unwrap_err();
+    assert!(matches!(err, ironclaw_turns::TurnError::ScopeNotFound));
+    assert!(port.calls().is_empty(), "wrong scope must not reach port");
+    assert_eq!(
+        run_status(&store, &scope, run_id).await,
+        TurnStatus::BlockedAttested
+    );
+}
+
+#[tokio::test]
+async fn attested_resume_wrong_gate_does_not_call_port() {
+    let port = Arc::new(MockAttestedResumePort::accepting());
+    let store = Arc::new(InMemoryTurnStateStore::default().with_attested_resume_port(port.clone()));
+    let (run_id, scope) = submit_and_block_attested(&store, "thread-attested-wrong-gate").await;
+
+    let mut request = attested_resume(&scope, run_id, Some("claim-good"));
+    request.gate_resolution_ref = GateRef::new("gate-wrong").unwrap();
+    let err = store.resume_turn(request).await.unwrap_err();
+    assert!(matches!(
+        err,
+        ironclaw_turns::TurnError::InvalidRequest { .. }
+    ));
+    assert!(port.calls().is_empty(), "gate mismatch must not reach port");
+    assert_eq!(
+        run_status(&store, &scope, run_id).await,
+        TurnStatus::BlockedAttested
+    );
+}
+
+#[tokio::test]
+async fn standard_resume_carrying_attestation_does_not_enter_attested_path() {
+    // A non-`BlockedAttested` resume that happens to carry an attestation claim
+    // must take the standard requeue path and never consult the attested port.
+    let port = Arc::new(MockAttestedResumePort::accepting());
+    let store = Arc::new(InMemoryTurnStateStore::default().with_attested_resume_port(port.clone()));
+    let (run_id, scope) = submit_and_block_standard(
+        &store,
+        "thread-approval-with-attestation",
+        BlockedReason::Approval {
+            gate_ref: GateRef::new("gate-approval-attn").unwrap(),
+        },
+    )
+    .await;
+
+    let mut request = standard_resume(&scope, run_id, "gate-approval-attn");
+    request.attestation = Some(AttestationClaimRef::new("stray-claim").unwrap());
+    let response = store.resume_turn(request).await.unwrap();
+    assert_eq!(response.status, TurnStatus::Queued);
+    assert!(!response.replayed);
+    assert!(
+        port.calls().is_empty(),
+        "standard resume must not enter the attested path"
+    );
+}
+
 // ---- regression: existing blocked reasons unchanged ------------------------
 
 #[tokio::test]
@@ -405,6 +598,16 @@ fn received_at() -> DateTime<Utc> {
 fn scope(thread: &str) -> TurnScope {
     TurnScope::new(
         TenantId::new("tenant1").unwrap(),
+        Some(AgentId::new("agent1").unwrap()),
+        Some(ProjectId::new("project1").unwrap()),
+        ThreadId::new(thread).unwrap(),
+    )
+}
+
+/// A scope in a different tenant, for wrong-scope rejection tests.
+fn scope_other(thread: &str) -> TurnScope {
+    TurnScope::new(
+        TenantId::new("tenant-other").unwrap(),
         Some(AgentId::new("agent1").unwrap()),
         Some(ProjectId::new("project1").unwrap()),
         ThreadId::new(thread).unwrap(),

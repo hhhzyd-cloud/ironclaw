@@ -240,6 +240,7 @@ impl TurnCoordinator for FakeTurnCoordinator {
             run_id: TurnRunId::new(),
             status: TurnStatus::Queued,
             event_cursor: EventCursor(11),
+            replayed: false,
         })
     }
 
