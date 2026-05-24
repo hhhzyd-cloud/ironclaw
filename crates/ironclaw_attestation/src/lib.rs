@@ -12,7 +12,8 @@
 //! ## Purity invariant
 //!
 //! This crate depends ONLY on `ironclaw_signing_provider`, `serde`,
-//! `thiserror`, and `sha2`. It carries **no chain SDK** (no `solana-sdk`,
+//! `thiserror`, `sha2`, and `async-trait` (PR3 added the async store/ledger
+//! traits). It carries **no chain SDK** (no `solana-sdk`,
 //! `near-*`, `alloy`), **no secrets**, and **no webauthn** — those land in
 //! PR4/PR6. The architecture boundary test
 //! (`crates/ironclaw_architecture/tests/attested_signing_boundaries.rs`)
@@ -32,6 +33,8 @@ mod approved_tx_hash;
 mod canonical;
 mod decoded_tx;
 mod fields;
+mod grant;
+mod ledger;
 mod rendered;
 
 pub use approved_tx_hash::compute_approved_tx_hash;
@@ -40,6 +43,11 @@ pub use decoded_tx::{
     Bytes32, DecodedTransaction, EvmAccessListEntry, EvmAddress, EvmTransaction, NearAction,
     NearTransaction, RenderingSchemaVersion, SolanaInstruction, SolanaTransaction,
 };
+pub use grant::{
+    AttestedSigningGrant, ClaimedGrant, GrantError, GrantKey, GrantStatus,
+    InMemorySealedGrantStore, SealedGrantStore,
+};
+pub use ledger::{InMemorySigningLedger, LedgerError, SigningLedger, SigningLedgerState};
 pub use rendered::{RenderedField, RenderedTx, render};
 
 // Re-export the binding hash type so downstream PRs import it from the
