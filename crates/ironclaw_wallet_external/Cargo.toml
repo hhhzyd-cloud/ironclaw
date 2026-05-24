@@ -1,6 +1,7 @@
 [package]
 name = "ironclaw_wallet_external"
 version = "0.1.0"
+publish = false  # internal substrate crate; not yet released to crates.io
 edition = "2024"
 rust-version = "1.92"
 description = "External-wallet signing providers (browser injected window.ethereum / window.solana) for the IronClaw attested-signing substrate"

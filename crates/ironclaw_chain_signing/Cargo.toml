@@ -1,6 +1,7 @@
 [package]
 name = "ironclaw_chain_signing"
 version = "0.1.0"
+publish = false  # internal substrate crate; not yet released to crates.io
 edition = "2024"
 rust-version = "1.92"
 description = "Custodial chain-key signing + per-chain decode/render/sign/broadcast/policy for the IronClaw attested-signing substrate (EVM/Solana/NEAR)"
