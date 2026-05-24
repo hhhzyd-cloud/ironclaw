@@ -54,11 +54,13 @@ mod port;
 mod ship_gate;
 
 pub use binding::{
-    AttestedGateBinding, AttestedGateBindingStore, InMemoryAttestedGateBindingStore,
+    AttestedGateBinding, AttestedGateBindingStore, BindingError, InMemoryAttestedGateBindingStore,
+    validate_binding,
 };
 pub use driver::{
-    AttestedSignerContinuationDriver, Broadcaster, ContinuationError, CustodialSignerLike,
-    ProviderRegistry, SignerContinuationOutcome,
+    AttestedSignerContinuationDriver, BroadcastDisposition, BroadcastOutcome, Broadcaster,
+    ContinuationError, CustodialSignerLike, EvmSignable, ProviderRegistry, RebuildError,
+    SignerContinuationOutcome,
 };
 pub use port::{
     InMemoryResumeGuard, ResumeGuard, RuntimeAttestedResumePort, approved_tx_hash_ref_hex,

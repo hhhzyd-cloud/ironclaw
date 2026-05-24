@@ -5059,6 +5059,7 @@ name = "ironclaw_attested_runtime"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips",
  "alloy-primitives",
  "async-trait",
  "chrono",
@@ -5752,10 +5753,13 @@ dependencies = [
 name = "ironclaw_reborn_composition"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
  "async-trait",
  "axum 0.8.9",
  "chrono",
  "deadpool-postgres",
+ "hex",
  "http 1.4.0",
  "http-body-util",
  "ironclaw_attestation",

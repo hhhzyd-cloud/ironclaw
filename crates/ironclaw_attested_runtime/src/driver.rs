@@ -38,10 +38,13 @@ use ironclaw_attestation::{SigningLedger, SigningLedgerState};
 use ironclaw_chain_signing::{
     ChainSigningError, CustodialSignRequest, CustodialSigner, recompute_approved_hash,
 };
+
+mod rebuild;
 use ironclaw_signing_provider::{
     GateRef, ProviderId, SigningContext, SigningProof, SigningProvider, SigningProviderError,
     TrustModel,
 };
+pub use rebuild::{EvmSignable, RebuildError};
 
 use crate::binding::{AttestedGateBinding, AttestedGateBindingStore};
 
@@ -73,14 +76,55 @@ impl ProviderRegistry {
     }
 }
 
+/// Whether the continuation actually submitted the signed transaction to the
+/// chain, or signed-only (dry-run / local-dev). Kept TYPED and distinct so a
+/// non-broadcasting path can NEVER be mistaken for a real broadcast: a caller
+/// that wants a real submit must match on [`BroadcastDisposition::Submitted`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BroadcastDisposition {
+    /// The signed transaction was submitted to the chain. The ledger reached
+    /// `BroadcastSubmitted`.
+    Submitted {
+        /// Opaque chain transaction id / hash (never key material).
+        tx_id: String,
+    },
+    /// The transaction was signed but NOT submitted (a dry-run / local-dev
+    /// broadcaster). The ledger is left at `Signed` — it does NOT reach
+    /// `BroadcastSubmitted`, so the runtime never reports a successful broadcast
+    /// for a non-broadcast.
+    NotBroadcast {
+        /// Opaque reason the submit was skipped.
+        reason: String,
+    },
+}
+
+/// What a [`Broadcaster`] produced for one submit attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BroadcastOutcome {
+    /// The signed transaction was accepted by the chain.
+    Submitted {
+        /// Opaque chain transaction id / hash.
+        tx_id: String,
+    },
+    /// The broadcaster deliberately did not submit (dry-run / local-dev). This
+    /// is NOT an error and NOT a broadcast.
+    NotBroadcast {
+        /// Opaque reason the submit was skipped.
+        reason: String,
+    },
+}
+
 /// What the continuation produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignerContinuationOutcome {
     /// The `gate_ref` that was continued.
     pub gate_ref: GateRef,
-    /// The ledger state reached (always `BroadcastSubmitted` on success of the
-    /// broadcast step; the driver leaves finalization to the chain watcher).
+    /// The ledger state reached. `BroadcastSubmitted` ONLY when the signed tx
+    /// was actually submitted; a dry-run / non-broadcasting path leaves this at
+    /// `Signed`. The driver leaves finalization to the chain watcher.
     pub ledger_state: SigningLedgerState,
+    /// Whether the signed tx was actually submitted to the chain.
+    pub broadcast: BroadcastDisposition,
     /// The signer/account the broadcast was attributed to (public).
     pub signer: String,
 }
@@ -107,6 +151,14 @@ pub enum ContinuationError {
     /// The sign-time approved-tx-hash re-check failed (threat #3): the hash
     /// recomputed from the persisted decoded tx diverged from the bound hash.
     ApprovedHashMismatch,
+    /// The binding's `chain` does not match the chain/network of its own decoded
+    /// transaction (a malformed / tampered binding). Fail-closed before any key
+    /// use so a testnet `chain` can never carry a mainnet decoded tx (or vice
+    /// versa) past the ship-gate.
+    BindingChainMismatch,
+    /// The authoritative decoded binding could not be reconstructed into a
+    /// signable transaction (unsupported chain/tx-type, or a field overflow).
+    Rebuild(RebuildError),
     /// A broadcaster-side failure.
     Broadcast {
         /// Opaque description (never key material).
@@ -127,6 +179,10 @@ impl std::fmt::Display for ContinuationError {
             Self::ApprovedHashMismatch => {
                 write!(f, "sign-time approved-tx-hash re-check failed")
             }
+            Self::BindingChainMismatch => {
+                write!(f, "binding chain does not match its decoded transaction")
+            }
+            Self::Rebuild(e) => write!(f, "decoded-binding rebuild failed: {e}"),
             Self::Broadcast { reason } => write!(f, "broadcast failed: {reason}"),
         }
     }
@@ -145,13 +201,20 @@ impl From<ironclaw_attestation::LedgerError> for ContinuationError {
 /// per-chain broadcaster; the ledger guard around it is identical regardless.
 #[async_trait]
 pub trait Broadcaster: Send + Sync {
-    /// Submit the signed transaction for `context`'s chain. Returns the opaque
-    /// transaction id / hash on success.
+    /// Whether this broadcaster actually submits to a chain. A real per-chain
+    /// broadcaster returns `true`; a dry-run / local-dev broadcaster returns
+    /// `false`. The driver consults this BEFORE advancing the ledger so a
+    /// non-broadcasting path never reaches `BroadcastSubmitted`.
+    fn submits(&self) -> bool;
+
+    /// Submit the signed transaction for `context`'s chain. Returns a typed
+    /// [`BroadcastOutcome`] so a deliberate non-submit ([`BroadcastOutcome::NotBroadcast`])
+    /// is distinguishable from a real submit and from an error.
     async fn broadcast(
         &self,
         context: &SigningContext,
         signed: &[u8],
-    ) -> Result<String, ContinuationError>;
+    ) -> Result<BroadcastOutcome, ContinuationError>;
 }
 
 /// The signer-continuation driver, wired with the authoritative binding store,
@@ -196,6 +259,12 @@ where
     /// from the ceremony (external-wallet paths) — for the custodial path the
     /// proof is the WebAuthn assertion that authorized the in-house signer.
     ///
+    /// The driver NEVER accepts a caller-supplied signable transaction: the
+    /// custodial path reconstructs the signable *from the authoritative decoded
+    /// binding* and signs exactly that, so a resolver cannot pass an unapproved
+    /// tx (or a mainnet tx aimed past a testnet `binding.chain` ship-gate) after
+    /// approval (byte-drift defense, same class as PR6's `CustodialSigner`).
+    ///
     /// Steps, all fail-closed and ledger-guarded:
     /// 1. Read the authoritative binding for `gate_ref` (never trust the
     ///    caller).
@@ -205,15 +274,13 @@ where
     /// 3. Route to the bound provider / custodial signer to verify + claim the
     ///    sealed grant (threat #1) and produce the signature.
     /// 4. Advance the ledger to `BroadcastSubmitted` and broadcast.
-    pub async fn continue_after_resolved<EvmTx>(
+    pub async fn continue_after_resolved(
         &self,
         gate_ref: &GateRef,
         proof: &SigningProof,
-        evm_tx: Option<&EvmTx>,
     ) -> Result<SignerContinuationOutcome, ContinuationError>
     where
-        EvmTx: alloy_consensus::SignableTransaction<alloy_primitives::Signature>,
-        S: CustodialSignerLike<EvmTx>,
+        S: CustodialSignerLike,
     {
         let binding = self
             .bindings
@@ -243,7 +310,7 @@ where
         }
 
         match binding.provider_id {
-            ProviderId::Custodial => self.continue_custodial(gate_ref, &binding, evm_tx).await,
+            ProviderId::Custodial => self.continue_custodial(gate_ref, &binding).await,
             external => {
                 self.continue_external_wallet(gate_ref, external, &binding, proof)
                     .await
@@ -294,21 +361,20 @@ where
         .await
     }
 
-    /// Custodial continuation: IronClaw holds the key. Delegate to the
-    /// [`CustodialSigner`], which runs the ship-gate, claims the sealed grant
-    /// (threat #1), re-checks the approved hash (threat #3), and signs with the
-    /// ecrecover binding check (threat #5). The signer advances the ledger
-    /// Signing->Signed itself; here we broadcast and advance to
-    /// BroadcastSubmitted.
-    async fn continue_custodial<EvmTx>(
+    /// Custodial continuation: IronClaw holds the key. The driver reconstructs
+    /// the signable *from `binding.decoded`* (never from any caller-supplied tx)
+    /// and delegates to the [`CustodialSigner`], which runs the ship-gate,
+    /// claims the sealed grant (threat #1), re-checks the approved hash
+    /// (threat #3), and signs with the ecrecover binding check (threat #5). The
+    /// signer advances the ledger Signing->Signed itself; here we broadcast and
+    /// advance to BroadcastSubmitted.
+    async fn continue_custodial(
         &self,
         gate_ref: &GateRef,
         binding: &AttestedGateBinding,
-        evm_tx: Option<&EvmTx>,
     ) -> Result<SignerContinuationOutcome, ContinuationError>
     where
-        EvmTx: alloy_consensus::SignableTransaction<alloy_primitives::Signature>,
-        S: CustodialSignerLike<EvmTx>,
+        S: CustodialSignerLike,
     {
         // Pre-flight enforcement point #2 mirror (threat #3): re-check the hash
         // from the persisted decoded tx before doing anything chain-side, so a
@@ -318,10 +384,19 @@ where
             return Err(ContinuationError::ApprovedHashMismatch);
         }
 
-        let evm_tx = evm_tx.ok_or(ContinuationError::ChainSigning(ChainSigningError::Sign {
-            chain: "evm",
-            reason: "custodial continuation requires the signable transaction".to_string(),
-        }))?;
+        // The binding's authoritative `chain` must match the chain/network its
+        // OWN decoded tx encodes. This closes the testnet-chain / mainnet-tx
+        // smuggle: the ship-gate keys off `binding.chain`, so the tx we sign
+        // must belong to that exact chain. (The signer re-checks family; this
+        // adds the precise network identity check at the driver.)
+        if binding.chain.as_str() != binding.decoded.chain_network() {
+            return Err(ContinuationError::BindingChainMismatch);
+        }
+
+        // Reconstruct the signable from the approved decoded tx — the only tx
+        // the driver ever signs. No caller-supplied signable is accepted.
+        let signable =
+            rebuild::rebuild_evm_signable(&binding.decoded).map_err(ContinuationError::Rebuild)?;
 
         let req = CustodialSignRequest {
             context: binding.context.clone(),
@@ -334,7 +409,7 @@ where
 
         let outcome = self
             .custodial_signer
-            .sign_evm(&req, evm_tx)
+            .sign_rebuilt_evm(&req, &signable)
             .await
             .map_err(ContinuationError::ChainSigning)?;
 
@@ -347,10 +422,16 @@ where
         .await
     }
 
-    /// Shared broadcast tail: advance the ledger to `BroadcastSubmitted`, then
-    /// submit. The ledger advance happens BEFORE the network submit so a
-    /// `Stuck->InProgress` recovery that re-enters here sees the row already at
-    /// `BroadcastSubmitted` and the guard refuses a second signing (threat #7).
+    /// Shared broadcast tail. For a broadcaster that actually submits
+    /// ([`Broadcaster::submits`] == true), advance the ledger to
+    /// `BroadcastSubmitted` BEFORE the network submit so a `Stuck->InProgress`
+    /// recovery that re-enters here sees the row already at `BroadcastSubmitted`
+    /// and the guard refuses a second signing (threat #7).
+    ///
+    /// For a non-broadcasting (dry-run / local-dev) broadcaster, the ledger is
+    /// left at `Signed` and the outcome is [`BroadcastDisposition::NotBroadcast`]:
+    /// the runtime never advances to `BroadcastSubmitted` for a non-broadcast,
+    /// so a signed-only continuation can never be reported as a real broadcast.
     async fn broadcast_signed(
         &self,
         gate_ref: &GateRef,
@@ -358,47 +439,85 @@ where
         signed: &[u8],
         signer: String,
     ) -> Result<SignerContinuationOutcome, ContinuationError> {
-        self.ledger
-            .advance(gate_ref, SigningLedgerState::BroadcastSubmitted)
-            .await?;
-        self.broadcaster.broadcast(context, signed).await?;
-        Ok(SignerContinuationOutcome {
-            gate_ref: gate_ref.clone(),
-            ledger_state: SigningLedgerState::BroadcastSubmitted,
-            signer,
-        })
+        if self.broadcaster.submits() {
+            // Real submit: advance the ledger first (idempotency guard), then
+            // submit under the guard.
+            self.ledger
+                .advance(gate_ref, SigningLedgerState::BroadcastSubmitted)
+                .await?;
+            match self.broadcaster.broadcast(context, signed).await? {
+                BroadcastOutcome::Submitted { tx_id } => Ok(SignerContinuationOutcome {
+                    gate_ref: gate_ref.clone(),
+                    ledger_state: SigningLedgerState::BroadcastSubmitted,
+                    broadcast: BroadcastDisposition::Submitted { tx_id },
+                    signer,
+                }),
+                // A broadcaster that declared `submits() == true` but returned
+                // NotBroadcast is contradictory; fail closed rather than report
+                // a false broadcast or a false non-broadcast.
+                BroadcastOutcome::NotBroadcast { reason } => Err(ContinuationError::Broadcast {
+                    reason: format!(
+                        "broadcaster declared submits()==true but did not broadcast: {reason}"
+                    ),
+                }),
+            }
+        } else {
+            // Dry-run / local-dev: never advance to BroadcastSubmitted. Record
+            // the intent but leave the ledger at Signed.
+            let reason = match self.broadcaster.broadcast(context, signed).await? {
+                BroadcastOutcome::NotBroadcast { reason } => reason,
+                // A non-submitting broadcaster that claims a real submit is
+                // contradictory; fail closed.
+                BroadcastOutcome::Submitted { .. } => {
+                    return Err(ContinuationError::Broadcast {
+                        reason: "broadcaster declared submits()==false but reported a submit"
+                            .to_string(),
+                    });
+                }
+            };
+            Ok(SignerContinuationOutcome {
+                gate_ref: gate_ref.clone(),
+                ledger_state: SigningLedgerState::Signed,
+                broadcast: BroadcastDisposition::NotBroadcast { reason },
+                signer,
+            })
+        }
     }
 }
 
-/// Abstracts the custodial signer's `sign_evm` so the driver is generic over
-/// the concrete [`CustodialSigner`] type parameters without naming all three.
+/// Abstracts the custodial signer so the driver is not generic over the
+/// concrete [`CustodialSigner`] type parameters and never has to accept a
+/// caller-supplied signable. The driver hands the signer the EVM signable it
+/// reconstructed from the authoritative decoded binding ([`rebuild::EvmSignable`]),
+/// and the signer runs both enforcement points and the ecrecover binding check.
 #[async_trait]
-pub trait CustodialSignerLike<EvmTx>: Send + Sync
-where
-    EvmTx: alloy_consensus::SignableTransaction<alloy_primitives::Signature>,
-{
-    /// Sign the EVM transaction for the request, running both enforcement
-    /// points and the ecrecover binding check.
-    async fn sign_evm(
+pub trait CustodialSignerLike: Send + Sync {
+    /// Sign the EVM signable the driver rebuilt from `req.decoded`, dispatching
+    /// on its concrete tx type. Runs both enforcement points and the ecrecover
+    /// binding check.
+    async fn sign_rebuilt_evm(
         &self,
         req: &CustodialSignRequest,
-        tx: &EvmTx,
+        signable: &rebuild::EvmSignable,
     ) -> Result<ironclaw_chain_signing::CustodialSignOutcome, ChainSigningError>;
 }
 
 #[async_trait]
-impl<K, G, L, EvmTx> CustodialSignerLike<EvmTx> for CustodialSigner<K, G, L>
+impl<K, G, L> CustodialSignerLike for CustodialSigner<K, G, L>
 where
     K: ironclaw_chain_signing::KeyStore,
     G: ironclaw_attestation::SealedGrantStore,
     L: SigningLedger,
-    EvmTx: alloy_consensus::SignableTransaction<alloy_primitives::Signature> + Sync,
 {
-    async fn sign_evm(
+    async fn sign_rebuilt_evm(
         &self,
         req: &CustodialSignRequest,
-        tx: &EvmTx,
+        signable: &rebuild::EvmSignable,
     ) -> Result<ironclaw_chain_signing::CustodialSignOutcome, ChainSigningError> {
-        CustodialSigner::sign_evm(self, req, tx).await
+        match signable {
+            rebuild::EvmSignable::Eip1559(tx) => CustodialSigner::sign_evm(self, req, tx).await,
+            rebuild::EvmSignable::Legacy(tx) => CustodialSigner::sign_evm(self, req, tx).await,
+            rebuild::EvmSignable::Eip2930(tx) => CustodialSigner::sign_evm(self, req, tx).await,
+        }
     }
 }

@@ -941,13 +941,13 @@ fn build_attested_composition(
     let ship_gate = CustodialMainnetShipGate::from_env().build_chain_ship_gate(None);
 
     let grants = Arc::new(InMemorySealedGrantStore::new());
-    RebornAttestedComposition::new(
-        bindings,
-        keystore,
-        ship_gate,
-        grants,
-        ProviderRegistry::new(),
-    )
+    // Provider-registration seam: local-dev wires no external-wallet providers
+    // (custodial-only). PR13's `AttestedProvidersConfig` layers on this closure
+    // to register WalletConnect / Injected / NEAR providers over the SAME shared
+    // `grants` store the driver uses (shared one-shot CAS, threat #1).
+    RebornAttestedComposition::new(bindings, keystore, ship_gate, grants, |_grants| {
+        ProviderRegistry::new()
+    })
 }
 
 const LOOP_RUN_CAPABILITY_ID: &str = "loop.run";

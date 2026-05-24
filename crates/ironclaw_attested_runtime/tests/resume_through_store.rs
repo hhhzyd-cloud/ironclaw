@@ -186,7 +186,8 @@ async fn real_port_resolves_attested_gate_and_never_requeues_loop() {
                 schema_version: RenderingSchemaVersion::CURRENT,
             },
         )
-        .await;
+        .await
+        .expect("binding insert succeeds");
 
     let (run_id, scope) = submit_and_block_attested(&store, "thread-e2e", &hash_ref).await;
 

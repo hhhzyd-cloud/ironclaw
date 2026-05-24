@@ -27,9 +27,11 @@ ironclaw_wallet_external = { path = "../ironclaw_wallet_external" }
 # ResourceScope is the authoritative custodial keystore/AAD owner carried on the
 # gate binding (host-api is already in the chain-signing dependency closure).
 ironclaw_host_api = { path = "../ironclaw_host_api" }
-# The driver's EVM custodial path is generic over alloy's SignableTransaction.
+# The driver reconstructs the EVM signable from the authoritative decoded
+# binding (byte-drift defense), signing only the approved bytes.
 alloy-consensus = "1"
 alloy-primitives = "1"
+alloy-eips = "1"
 
 [dev-dependencies]
 async-trait = "0.1"

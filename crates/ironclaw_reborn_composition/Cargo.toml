@@ -129,6 +129,14 @@ tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "
 # proper WS client.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 tower = { version = "0.5", features = ["util"] }
+# Attested-signing composition test (real RebornAttestedComposition end-to-end).
+ironclaw_chain_signing = { path = "../ironclaw_chain_signing" }
+ironclaw_attestation = { path = "../ironclaw_attestation" }
+ironclaw_signing_provider = { path = "../ironclaw_signing_provider" }
+secrecy = "0.10"
+hex = "0.4"
+alloy-consensus = "1"
+alloy-primitives = "1"
 
 [lints]
 workspace = true

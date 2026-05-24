@@ -172,14 +172,97 @@ mod ironclaw_reborn_noop {
 
     #[async_trait::async_trait]
     impl ironclaw_attested_runtime::Broadcaster for NoopBroadcaster {
+        fn submits(&self) -> bool {
+            false
+        }
+
         async fn broadcast(
             &self,
             _context: &SigningContext,
             _signed: &[u8],
-        ) -> Result<String, ContinuationError> {
-            Ok("noop".to_string())
+        ) -> Result<ironclaw_attested_runtime::BroadcastOutcome, ContinuationError> {
+            Ok(ironclaw_attested_runtime::BroadcastOutcome::NotBroadcast {
+                reason: "test noop".to_string(),
+            })
         }
     }
+}
+
+/// A broadcaster that REALLY submits (reports `submits() == true`) and counts
+/// every submit, so a test can assert true broadcast idempotency: a replayed
+/// continuation must produce ZERO additional submit calls, not merely a
+/// returned ledger error.
+mod recording {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[derive(Default)]
+    pub struct RecordingBroadcaster {
+        pub calls: AtomicUsize,
+    }
+
+    impl RecordingBroadcaster {
+        pub fn count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ironclaw_attested_runtime::Broadcaster for RecordingBroadcaster {
+        fn submits(&self) -> bool {
+            true
+        }
+
+        async fn broadcast(
+            &self,
+            _context: &SigningContext,
+            _signed: &[u8],
+        ) -> Result<ironclaw_attested_runtime::BroadcastOutcome, ContinuationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ironclaw_attested_runtime::BroadcastOutcome::Submitted {
+                tx_id: "recorded-tx".to_string(),
+            })
+        }
+    }
+}
+
+/// The concrete custodial driver type backed by a [`recording::RecordingBroadcaster`].
+type RecordingCustodialDriver = AttestedSignerContinuationDriver<
+    recording::RecordingBroadcaster,
+    InMemorySigningLedger,
+    CustodialSigner<SecretsKeyStore, InMemorySealedGrantStore, InMemorySigningLedger>,
+>;
+
+/// Assemble a custodial driver wired to a shared recording broadcaster so a
+/// test can assert how many real submits happened.
+fn custodial_driver_recording(
+    keystore: Arc<SecretsKeyStore>,
+    bindings: Arc<InMemoryAttestedGateBindingStore>,
+    broadcaster: Arc<recording::RecordingBroadcaster>,
+) -> (
+    RecordingCustodialDriver,
+    Arc<InMemorySealedGrantStore>,
+    Arc<InMemorySigningLedger>,
+) {
+    let grants = Arc::new(InMemorySealedGrantStore::new());
+    let ledger = Arc::new(InMemorySigningLedger::new());
+    let ship_gate = CustodialMainnetShipGate::new(false).build_chain_ship_gate(None);
+    let signer = Arc::new(CustodialSigner::new(
+        Arc::clone(&keystore),
+        Arc::clone(&grants),
+        Arc::clone(&ledger),
+        ship_gate,
+        Arc::new(DenyFirstCustodyPolicy),
+    ));
+    let driver = AttestedSignerContinuationDriver::new(
+        Arc::clone(&bindings) as Arc<dyn AttestedGateBindingStore>,
+        ProviderRegistry::new(),
+        signer,
+        Arc::clone(&ledger),
+        broadcaster,
+    );
+    (driver, grants, ledger)
 }
 
 async fn seal_grant(grants: &InMemorySealedGrantStore, ctx: &SigningContext, hash: ApprovedTxHash) {
@@ -196,6 +279,17 @@ async fn put_binding(
     decoded: DecodedTransaction,
     hash: ApprovedTxHash,
 ) {
+    put_binding_res(bindings, ctx, decoded, hash)
+        .await
+        .expect("binding insert succeeds");
+}
+
+async fn put_binding_res(
+    bindings: &InMemoryAttestedGateBindingStore,
+    ctx: &SigningContext,
+    decoded: DecodedTransaction,
+    hash: ApprovedTxHash,
+) -> Result<(), ironclaw_attested_runtime::BindingError> {
     bindings
         .put(
             SigningGateRef::new(GATE),
@@ -209,7 +303,7 @@ async fn put_binding(
                 schema_version: RenderingSchemaVersion::CURRENT,
             },
         )
-        .await;
+        .await
 }
 
 // ── Threat #18: ship-gate refuses custodial mainnet without KMS ───────────
@@ -238,34 +332,47 @@ async fn threat_1_and_6_custodial_replay_and_broadcast_retry_blocked() {
     let priv_bytes = [0x11u8; 32];
     let (keystore, account) = keystore_with_evm_key(&priv_bytes).await;
     let ctx = signing_context(&account);
-    let (tx, decoded, hash) = sample_evm();
+    let (_tx, decoded, hash) = sample_evm();
 
     let bindings = Arc::new(InMemoryAttestedGateBindingStore::new());
-    let (driver, grants, _ledger) = custodial_driver(Arc::clone(&keystore), Arc::clone(&bindings));
+    let broadcaster = Arc::new(recording::RecordingBroadcaster::default());
+    let (driver, grants, _ledger) = custodial_driver_recording(
+        Arc::clone(&keystore),
+        Arc::clone(&bindings),
+        Arc::clone(&broadcaster),
+    );
     seal_grant(&grants, &ctx, hash).await;
     put_binding(&bindings, &ctx, decoded, hash).await;
 
     let gate = SigningGateRef::new(GATE);
     let proof = SigningProof::WebAuthnAssertionProof(vec![]);
 
-    // First continuation: signs + advances ledger to BroadcastSubmitted.
+    // First continuation: signs the tx REBUILT FROM THE BINDING + really
+    // broadcasts (one submit), advancing the ledger to BroadcastSubmitted.
     let outcome = driver
-        .continue_after_resolved(&gate, &proof, Some(&tx))
+        .continue_after_resolved(&gate, &proof)
         .await
         .expect("first continuation succeeds");
     assert_eq!(outcome.ledger_state, SigningLedgerState::BroadcastSubmitted);
+    assert_eq!(broadcaster.count(), 1, "exactly one real broadcast");
 
     // Second continuation of the SAME gate: the ledger row already exists and
     // is past Signed, so the deterministic continuation is refused (threats
     // #6/#7). The sealed grant was also already claimed (threat #1) — either
     // guard alone fails the replay closed.
     let err = driver
-        .continue_after_resolved(&gate, &proof, Some(&tx))
+        .continue_after_resolved(&gate, &proof)
         .await
         .expect_err("replay/broadcast-retry must fail closed");
     assert!(
         matches!(err, ContinuationError::Ledger(_)),
         "expected ledger guard rejection, got {err:?}"
+    );
+    // TRUE idempotency: the replay produced ZERO additional broadcast calls.
+    assert_eq!(
+        broadcaster.count(),
+        1,
+        "replay must not produce a second broadcast"
     );
 }
 
@@ -287,34 +394,103 @@ async fn threat_1_sealed_grant_one_shot_claim() {
     let _ = keystore; // keep the bound key alive for parity with other cases
 }
 
-// ── Threat #3: caller-supplied hash rejected (sign-time re-check) ─────────
+// ── Threat #3: caller-supplied hash rejected ──────────────────────────────
+//
+// Two layers, both fail-closed:
+//   (a) the binding store refuses to PERSIST a binding whose approved hash does
+//       not match its own decoded tx (immutable, validated write — fix #2); and
+//   (b) the driver RE-CHECKS the hash from the decoded tx at sign time (defense
+//       in depth, so a durable backend that somehow holds an inconsistent row
+//       still fails closed — exercised in `driver_rechecks_inconsistent_binding`).
 
 #[tokio::test]
-async fn threat_3_caller_supplied_hash_rejected() {
+async fn threat_3_inconsistent_binding_write_rejected() {
     let priv_bytes = [0x13u8; 32];
-    let (keystore, account) = keystore_with_evm_key(&priv_bytes).await;
+    let (_keystore, account) = keystore_with_evm_key(&priv_bytes).await;
     let ctx = signing_context(&account);
-    let (tx, decoded, real_hash) = sample_evm();
+    let (_tx, decoded, real_hash) = sample_evm();
 
-    // Bind a DIFFERENT (caller-asserted) hash than what the decoded tx hashes
-    // to. The driver/signer recompute from the persisted decoded tx and reject.
+    // A caller-asserted hash that does not match the decoded tx.
     let bogus_hash = ApprovedTxHash::from_bytes([0x99u8; 32]);
     assert_ne!(bogus_hash, real_hash);
 
-    let bindings = Arc::new(InMemoryAttestedGateBindingStore::new());
-    let (driver, grants, _ledger) = custodial_driver(Arc::clone(&keystore), Arc::clone(&bindings));
+    let bindings = InMemoryAttestedGateBindingStore::new();
+    let err = put_binding_res(&bindings, &ctx, decoded, bogus_hash)
+        .await
+        .expect_err("inconsistent binding write must be rejected");
+    assert_eq!(
+        err,
+        ironclaw_attested_runtime::BindingError::ApprovedHashMismatch
+    );
+}
+
+/// Driver-level defense in depth (fix #1 / #3): even if a backend somehow holds
+/// a binding whose stored hash diverges from its decoded tx, the driver
+/// re-checks at sign time and fails closed BEFORE any key use. Uses a tiny
+/// store mock that returns an inconsistent binding (the validated in-memory
+/// store would never persist one).
+#[tokio::test]
+async fn driver_rechecks_inconsistent_binding() {
+    use async_trait::async_trait;
+    use ironclaw_attested_runtime::AttestedGateBinding;
+
+    struct InconsistentStore(AttestedGateBinding);
+    #[async_trait]
+    impl AttestedGateBindingStore for InconsistentStore {
+        async fn put(
+            &self,
+            _gate_ref: SigningGateRef,
+            _binding: AttestedGateBinding,
+        ) -> Result<(), ironclaw_attested_runtime::BindingError> {
+            Ok(())
+        }
+        async fn get(&self, _gate_ref: &SigningGateRef) -> Option<AttestedGateBinding> {
+            Some(self.0.clone())
+        }
+    }
+
+    let priv_bytes = [0x13u8; 32];
+    let (keystore, account) = keystore_with_evm_key(&priv_bytes).await;
+    let ctx = signing_context(&account);
+    let (_tx, decoded, real_hash) = sample_evm();
+    let bogus_hash = ApprovedTxHash::from_bytes([0x99u8; 32]);
+    assert_ne!(bogus_hash, real_hash);
+
+    let inconsistent = AttestedGateBinding {
+        provider_id: ProviderId::Custodial,
+        context: ctx.clone(),
+        approved_tx_hash: bogus_hash, // diverges from `decoded`
+        decoded,
+        chain: ChainKeyId::new(DEV_TESTNET_CHAIN),
+        scope: owner_scope(),
+        schema_version: RenderingSchemaVersion::CURRENT,
+    };
+    let store: Arc<dyn AttestedGateBindingStore> = Arc::new(InconsistentStore(inconsistent));
+
+    let grants = Arc::new(InMemorySealedGrantStore::new());
     seal_grant(&grants, &ctx, bogus_hash).await;
-    put_binding(&bindings, &ctx, decoded, bogus_hash).await;
+    let ledger = Arc::new(InMemorySigningLedger::new());
+    let ship_gate = CustodialMainnetShipGate::new(false).build_chain_ship_gate(None);
+    let signer = Arc::new(CustodialSigner::new(
+        Arc::clone(&keystore),
+        Arc::clone(&grants),
+        Arc::clone(&ledger),
+        ship_gate,
+        Arc::new(DenyFirstCustodyPolicy),
+    ));
+    let driver = AttestedSignerContinuationDriver::new(
+        store,
+        ProviderRegistry::new(),
+        signer,
+        ledger,
+        Arc::new(ironclaw_reborn_noop::NoopBroadcaster),
+    );
 
     let gate = SigningGateRef::new(GATE);
     let err = driver
-        .continue_after_resolved(
-            &gate,
-            &SigningProof::WebAuthnAssertionProof(vec![]),
-            Some(&tx),
-        )
+        .continue_after_resolved(&gate, &SigningProof::WebAuthnAssertionProof(vec![]))
         .await
-        .expect_err("caller-supplied hash must be rejected");
+        .expect_err("driver must re-check and reject inconsistent binding");
     assert!(
         matches!(err, ContinuationError::ApprovedHashMismatch),
         "expected approved-hash mismatch, got {err:?}"
@@ -347,7 +523,7 @@ async fn threat_5_evm_from_spoof_caught_via_ecrecover() {
         .unwrap();
 
     let ctx = signing_context(&wrong_addr_hex);
-    let (tx, decoded, hash) = sample_evm();
+    let (_tx, decoded, hash) = sample_evm();
     let bindings = Arc::new(InMemoryAttestedGateBindingStore::new());
     let (driver, grants, _ledger) = custodial_driver(Arc::clone(&keystore), Arc::clone(&bindings));
     seal_grant(&grants, &ctx, hash).await;
@@ -355,11 +531,7 @@ async fn threat_5_evm_from_spoof_caught_via_ecrecover() {
 
     let gate = SigningGateRef::new(GATE);
     let err = driver
-        .continue_after_resolved(
-            &gate,
-            &SigningProof::WebAuthnAssertionProof(vec![]),
-            Some(&tx),
-        )
+        .continue_after_resolved(&gate, &SigningProof::WebAuthnAssertionProof(vec![]))
         .await
         .expect_err("ecrecover binding mismatch must fail closed");
     assert!(
@@ -381,7 +553,7 @@ async fn threat_7_double_broadcast_blocked_by_ledger_state() {
     let priv_bytes = [0x15u8; 32];
     let (keystore, account) = keystore_with_evm_key(&priv_bytes).await;
     let ctx = signing_context(&account);
-    let (tx, decoded, hash) = sample_evm();
+    let (_tx, decoded, hash) = sample_evm();
 
     let bindings = Arc::new(InMemoryAttestedGateBindingStore::new());
     let (driver, grants, ledger) = custodial_driver(Arc::clone(&keystore), Arc::clone(&bindings));
@@ -408,11 +580,7 @@ async fn threat_7_double_broadcast_blocked_by_ledger_state() {
     // The recovery re-drive must be refused (the create fails AlreadyExists and
     // the row is already broadcast).
     let err = driver
-        .continue_after_resolved(
-            &gate,
-            &SigningProof::WebAuthnAssertionProof(vec![]),
-            Some(&tx),
-        )
+        .continue_after_resolved(&gate, &SigningProof::WebAuthnAssertionProof(vec![]))
         .await
         .expect_err("double-broadcast after recovery must fail closed");
     assert!(
@@ -500,4 +668,81 @@ fn threat_3_resume_port_rejects_mismatched_expected_hash() {
         })
         .expect_err("mismatched expected hash must be rejected");
     assert_eq!(err, AttestedResumeRejection::BindingMismatch);
+}
+
+// ── Fix #2: authoritative binding writes are immutable + validated ────────
+
+#[tokio::test]
+async fn binding_write_is_insert_only_duplicate_rejected() {
+    let priv_bytes = [0x21u8; 32];
+    let (_keystore, account) = keystore_with_evm_key(&priv_bytes).await;
+    let ctx = signing_context(&account);
+    let (_tx, decoded, hash) = sample_evm();
+
+    let bindings = InMemoryAttestedGateBindingStore::new();
+    put_binding_res(&bindings, &ctx, decoded.clone(), hash)
+        .await
+        .expect("first write wins");
+    // A second write for the same gate_ref must fail closed — bindings are
+    // immutable, so a later write can never mutate the trusted binding.
+    let err = put_binding_res(&bindings, &ctx, decoded, hash)
+        .await
+        .expect_err("duplicate write must be rejected");
+    assert_eq!(err, ironclaw_attested_runtime::BindingError::AlreadyExists);
+}
+
+#[tokio::test]
+async fn binding_write_rejects_key_context_gate_ref_mismatch() {
+    use ironclaw_attested_runtime::{AttestedGateBinding, validate_binding};
+
+    let priv_bytes = [0x22u8; 32];
+    let (_keystore, account) = keystore_with_evm_key(&priv_bytes).await;
+    // Context's gate_ref is GATE, but we will key the binding under a DIFFERENT
+    // gate_ref. The store must reject it.
+    let ctx = signing_context(&account);
+    let (_tx, decoded, hash) = sample_evm();
+    let binding = AttestedGateBinding {
+        provider_id: ProviderId::Custodial,
+        context: ctx,
+        approved_tx_hash: hash,
+        decoded,
+        chain: ChainKeyId::new(DEV_TESTNET_CHAIN),
+        scope: owner_scope(),
+        schema_version: RenderingSchemaVersion::CURRENT,
+    };
+    let wrong_key = SigningGateRef::new("gate:some-other-gate");
+    let err = validate_binding(&wrong_key, &binding)
+        .expect_err("key/context gate_ref mismatch must be rejected");
+    assert_eq!(
+        err,
+        ironclaw_attested_runtime::BindingError::GateRefMismatch
+    );
+}
+
+#[tokio::test]
+async fn binding_write_rejects_chain_mismatch() {
+    use ironclaw_attested_runtime::AttestedGateBinding;
+
+    let priv_bytes = [0x23u8; 32];
+    let (_keystore, account) = keystore_with_evm_key(&priv_bytes).await;
+    let ctx = signing_context(&account);
+    let (_tx, decoded, hash) = sample_evm();
+
+    // The decoded tx is on eip155:11155111 (testnet); bind a MAINNET chain. The
+    // store must reject this so a testnet/mainnet smuggle never persists.
+    let binding = AttestedGateBinding {
+        provider_id: ProviderId::Custodial,
+        context: ctx,
+        approved_tx_hash: hash,
+        decoded,
+        chain: ChainKeyId::new("eip155:1"),
+        scope: owner_scope(),
+        schema_version: RenderingSchemaVersion::CURRENT,
+    };
+    let bindings = InMemoryAttestedGateBindingStore::new();
+    let err = bindings
+        .put(SigningGateRef::new(GATE), binding)
+        .await
+        .expect_err("chain mismatch must be rejected");
+    assert_eq!(err, ironclaw_attested_runtime::BindingError::ChainMismatch);
 }
