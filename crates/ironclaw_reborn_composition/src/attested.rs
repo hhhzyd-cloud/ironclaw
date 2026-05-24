@@ -27,14 +27,15 @@
 use std::sync::Arc;
 
 use ironclaw_attestation::{
-    InMemorySealedGrantStore, InMemorySigningLedger, SealedGrantStore, SigningLedger,
+    AttestedSigningGrant, GrantKey, InMemorySealedGrantStore, InMemorySigningLedger,
+    SealedGrantStore, SigningLedger,
 };
 use ironclaw_attested_runtime::{
-    AttestedGateBindingStore, AttestedSignerContinuationDriver, Broadcaster, ContinuationError,
-    InMemoryAttestedGateBindingStore, ProviderRegistry,
+    AttestedGateBinding, AttestedGateBindingStore, AttestedSignerContinuationDriver, Broadcaster,
+    ContinuationError, InMemoryAttestedGateBindingStore, ProviderRegistry,
 };
 use ironclaw_chain_signing::{CustodialSigner, DenyFirstCustodyPolicy, SecretsKeyStore, ShipGate};
-use ironclaw_signing_provider::SigningContext;
+use ironclaw_signing_provider::{GateRef, SigningContext};
 
 /// The custodial signer type, generic over the grant store and ledger backend.
 pub(crate) type ComposedCustodialSigner<G, L> = CustodialSigner<SecretsKeyStore, G, L>;
@@ -45,7 +46,7 @@ pub(crate) type ComposedContinuationDriver<B, G, L> =
 
 /// The local-dev / test monomorphization of [`RebornAttestedComposition`] the
 /// `RebornRuntime` holds (in-memory stores + no-op broadcaster).
-pub(crate) type LocalDevAttestedComposition =
+pub type LocalDevAttestedComposition =
     RebornAttestedComposition<NoopBroadcaster, InMemorySealedGrantStore, InMemorySigningLedger>;
 
 /// A broadcaster that records intent but performs no network I/O. The
@@ -68,11 +69,12 @@ impl Broadcaster for NoopBroadcaster {
     }
 }
 
-/// Bundles the attested-signing composition the reborn runtime exposes to the
-/// PR11 ingress: the shared binding store and the assembled continuation driver.
+/// PR11 ingress: the shared binding store and the assembled continuation
+/// driver.
 ///
 /// Generic over the durable-vs-in-memory grant store `G`, ledger `L`, and
-/// broadcaster `B`.
+/// broadcaster `B`. The `grants` store is retained so the raise side
+/// (`register_attested_gate`) can seal the one-shot grant (threat #1).
 pub struct RebornAttestedComposition<B, G, L>
 where
     B: Broadcaster + 'static,
@@ -80,6 +82,7 @@ where
     L: SigningLedger + 'static,
 {
     bindings: Arc<dyn AttestedGateBindingStore>,
+    grants: Arc<G>,
     driver: Arc<ComposedContinuationDriver<B, G, L>>,
 }
 
@@ -110,7 +113,7 @@ where
     ) -> Self {
         let custodial_signer = Arc::new(CustodialSigner::new(
             keystore,
-            grants,
+            Arc::clone(&grants),
             Arc::clone(&ledger),
             ship_gate,
             Arc::new(DenyFirstCustodyPolicy),
@@ -122,7 +125,41 @@ where
             ledger,
             broadcaster,
         ));
-        Self { bindings, driver }
+        Self {
+            bindings,
+            grants,
+            driver,
+        }
+    }
+
+    /// Persist the authoritative state when a `BlockedAttested` gate is raised
+    /// (attested-signing PR11 raise side).
+    ///
+    /// Records the authoritative [`AttestedGateBinding`] (gate_ref ∥ expected
+    /// `ApprovedTxHash` ∥ bound signer/account ∥ chain/tx-type) the resume port
+    /// and driver both read back, and seals the one-shot sealed grant the
+    /// external-wallet provider / custodial signer claims (threat #1). The
+    /// caller's later resume can only *attest* to this binding's hash — never
+    /// redefine it (threats #2 / #3 / #4).
+    ///
+    /// In-memory only (PR11); durable PG / libSQL backends are PR12.
+    pub async fn register_attested_gate(
+        &self,
+        gate_ref: GateRef,
+        binding: AttestedGateBinding,
+        created_at_ms: i64,
+        expiry_ms: Option<i64>,
+    ) -> Result<(), ironclaw_attestation::GrantError> {
+        let grant_key = GrantKey::from_context(&binding.context, binding.approved_tx_hash);
+        self.grants
+            .seal(AttestedSigningGrant::seal(
+                grant_key,
+                created_at_ms,
+                expiry_ms,
+            ))
+            .await?;
+        self.bindings.put(gate_ref, binding).await;
+        Ok(())
     }
 
     /// The authoritative gate-binding store. The PR11 ingress persists a

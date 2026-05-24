@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use ironclaw_attestation::InMemorySealedGrantStore;
+use ironclaw_attestation::{InMemorySealedGrantStore, SealedGrantStore};
 use ironclaw_attested_runtime::{
     CustodialMainnetShipGate, InMemoryAttestedGateBindingStore, ProviderRegistry,
 };
@@ -72,6 +72,7 @@ use ironclaw_turns::{
     TurnScope, TurnStatus,
     run_profile::{LoopHostMilestoneSink, LoopRunContext, PromptMode},
 };
+use ironclaw_wallet_external::InjectedSigningProvider;
 use secrecy::SecretString;
 
 use crate::attested::LocalDevAttestedComposition;
@@ -939,13 +940,24 @@ fn build_attested_composition(
     let ship_gate = CustodialMainnetShipGate::from_env().build_chain_ship_gate(None);
 
     let grants = Arc::new(InMemorySealedGrantStore::new());
-    LocalDevAttestedComposition::new_in_memory(
-        bindings,
-        keystore,
-        ship_gate,
-        grants,
-        ProviderRegistry::new(),
-    )
+
+    // Register the external-wallet providers that need no per-ceremony server
+    // secret over the SAME sealed-grant store the custodial signer uses, so the
+    // one-shot grant CAS (threat #1) is authoritative across both paths. The
+    // injected-wallet provider (`window.ethereum` / `window.solana`) is
+    // stateless: it recovers the signer from the proof and claims the grant. The
+    // NEAR-redirect and WalletConnect providers require ceremony config that the
+    // local-dev runtime does not own; in production they are registered by
+    // `build_attested_composition_with_config` (PR13). Without that config their
+    // wire variants still decode and reach the driver, which fails closed as
+    // `ProviderMismatch`.
+    let providers =
+        ProviderRegistry::new()
+            .with_provider(Arc::new(InjectedSigningProvider::new(
+                Arc::clone(&grants) as Arc<dyn SealedGrantStore>
+            )));
+
+    LocalDevAttestedComposition::new_in_memory(bindings, keystore, ship_gate, grants, providers)
 }
 
 const LOOP_RUN_CAPABILITY_ID: &str = "loop.run";

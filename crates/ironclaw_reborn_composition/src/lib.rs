@@ -19,6 +19,7 @@
 //! Gateway`, etc.
 
 mod attested;
+mod attested_continuation;
 mod auth;
 mod error;
 mod factory;
@@ -49,7 +50,8 @@ use ironclaw_runtime_policy::{EffectiveRuntimePolicy as ResolvedRuntimePolicy, R
 pub use attested::LibSqlAttestedComposition;
 #[cfg(all(feature = "postgres", feature = "attested-broadcast"))]
 pub use attested::PostgresAttestedComposition;
-pub use attested::{NoopBroadcaster, RebornAttestedComposition};
+pub use attested::{LocalDevAttestedComposition, NoopBroadcaster, RebornAttestedComposition};
+pub use attested_continuation::RebornAttestedContinuation;
 pub use auth::{
     RebornAuthContinuationDispatcher, RebornOAuthCallbackError, RebornOAuthCallbackOutcome,
     RebornOAuthCallbackRequest, RebornOAuthCallbackResponse, RebornProductAuthServices,
