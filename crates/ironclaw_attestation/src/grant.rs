@@ -228,12 +228,19 @@ impl SealedGrantStore for InMemorySealedGrantStore {
 /// behavioural contract lives once and every backend (in-memory here, durable
 /// PG / libSQL in stacked follow-ups) is driven through it. Invoke with a label
 /// and a zero-arg factory closure returning a fresh store.
-#[cfg(test)]
-pub(crate) mod contract {
+#[cfg(any(test, feature = "contract-tests"))]
+pub mod contract {
+    // The `pub` items below are reachable as `ironclaw_attestation::grant::
+    // contract::*` only when the `contract-tests` feature makes the `grant`
+    // module public (see lib.rs). Under the crate's own `cargo test` (no
+    // feature) the parent module is private, so the crate-level
+    // `unreachable_pub` warning would fire on every helper — suppress it for
+    // that build; the `pub` is intentional for out-of-crate consumers.
+    #![cfg_attr(not(feature = "contract-tests"), allow(unreachable_pub))]
     use super::*;
     use std::sync::Arc;
 
-    pub(crate) fn key(seed: u8) -> GrantKey {
+    pub fn key(seed: u8) -> GrantKey {
         GrantKey {
             tenant: TenantId::new("tenant-a"),
             user: UserId::new("user-1"),
@@ -245,7 +252,7 @@ pub(crate) mod contract {
         }
     }
 
-    pub(crate) async fn seal_then_claim_succeeds<S: SealedGrantStore>(store: S) {
+    pub async fn seal_then_claim_succeeds<S: SealedGrantStore>(store: S) {
         let k = key(1);
         store
             .seal(AttestedSigningGrant::seal(k.clone(), 1_000, None))
@@ -256,7 +263,7 @@ pub(crate) mod contract {
         assert_eq!(claimed.created_at_ms, 1_000);
     }
 
-    pub(crate) async fn second_claim_is_already_claimed<S: SealedGrantStore>(store: S) {
+    pub async fn second_claim_is_already_claimed<S: SealedGrantStore>(store: S) {
         let k = key(2);
         store
             .seal(AttestedSigningGrant::seal(k.clone(), 0, None))
@@ -266,11 +273,11 @@ pub(crate) mod contract {
         assert_eq!(store.claim(&k).await, Err(GrantError::AlreadyClaimed));
     }
 
-    pub(crate) async fn claim_unsealed_is_not_found<S: SealedGrantStore>(store: S) {
+    pub async fn claim_unsealed_is_not_found<S: SealedGrantStore>(store: S) {
         assert_eq!(store.claim(&key(3)).await, Err(GrantError::NotFound));
     }
 
-    pub(crate) async fn claim_mismatched_component_is_not_found<S: SealedGrantStore>(store: S) {
+    pub async fn claim_mismatched_component_is_not_found<S: SealedGrantStore>(store: S) {
         let sealed = key(4);
         store
             .seal(AttestedSigningGrant::seal(sealed.clone(), 0, None))
@@ -285,7 +292,85 @@ pub(crate) mod contract {
         assert_eq!(store.claim(&hash_mismatch).await, Err(GrantError::NotFound));
     }
 
-    pub(crate) async fn double_seal_is_already_sealed<S: SealedGrantStore>(store: S) {
+    /// Seal one grant, then attempt a claim that differs by EACH individual
+    /// [`GrantKey`] component in turn. Every single-component mismatch MUST be
+    /// treated as a distinct, never-sealed grant (`NotFound`).
+    ///
+    /// This pins a backend's unique key to ALL seven components. A durable
+    /// backend that omits, say, `chain_id` or `key_or_account_id` from its
+    /// primary/unique key would collapse two distinct grants into one and let a
+    /// claim for `chain B` consume the grant sealed for `chain A` — a real
+    /// cross-chain / cross-key authorization collision. Catching it here means
+    /// the durable backends cannot pass with an under-specified key.
+    pub async fn each_grant_key_component_is_part_of_identity<S: SealedGrantStore>(store: S) {
+        // Distinct, non-overlapping values for every mutator so no two mutated
+        // keys accidentally collide with each other or the sealed key.
+        let sealed = key(40);
+        store
+            .seal(AttestedSigningGrant::seal(sealed.clone(), 0, None))
+            .await
+            .expect("seal");
+
+        // One probe per component: each clones the sealed key and changes
+        // exactly that one field to a distinct value.
+        let probes = [
+            ("tenant", {
+                let mut k = sealed.clone();
+                k.tenant = TenantId::new("tenant-OTHER");
+                k
+            }),
+            ("user", {
+                let mut k = sealed.clone();
+                k.user = UserId::new("user-OTHER");
+                k
+            }),
+            ("run_id", {
+                let mut k = sealed.clone();
+                k.run_id = RunId::new("run-OTHER");
+                k
+            }),
+            ("gate_ref", {
+                let mut k = sealed.clone();
+                k.gate_ref = GateRef::new("gate:OTHER");
+                k
+            }),
+            ("approved_tx_hash", {
+                let mut k = sealed.clone();
+                k.approved_tx_hash = ApprovedTxHash::from_bytes([0xAB; 32]);
+                k
+            }),
+            ("key_or_account_id", {
+                let mut k = sealed.clone();
+                k.key_or_account_id = KeyOrAccountId::new("0xOTHER");
+                k
+            }),
+            ("chain_id", {
+                let mut k = sealed.clone();
+                k.chain_id = ChainId::new("eip155:999");
+                k
+            }),
+        ];
+
+        for (component, probe) in probes {
+            assert_ne!(
+                probe, sealed,
+                "probe for `{component}` must actually change the key"
+            );
+            assert_eq!(
+                store.claim(&probe).await,
+                Err(GrantError::NotFound),
+                "claim differing only by `{component}` must be a distinct (unsealed) grant"
+            );
+        }
+
+        // The original grant is still untouched and claimable exactly once.
+        store
+            .claim(&sealed)
+            .await
+            .expect("the sealed grant itself must still be claimable");
+    }
+
+    pub async fn double_seal_is_already_sealed<S: SealedGrantStore>(store: S) {
         let k = key(5);
         store
             .seal(AttestedSigningGrant::seal(k.clone(), 0, None))
@@ -297,7 +382,7 @@ pub(crate) mod contract {
         );
     }
 
-    pub(crate) async fn concurrent_claims_yield_exactly_one_winner<S>(store: S)
+    pub async fn concurrent_claims_yield_exactly_one_winner<S>(store: S)
     where
         S: SealedGrantStore + 'static,
     {
@@ -349,6 +434,13 @@ pub(crate) mod contract {
                 async fn claim_mismatched_component_is_not_found() {
                     $crate::grant::contract::claim_mismatched_component_is_not_found($factory())
                         .await;
+                }
+                #[tokio::test]
+                async fn each_grant_key_component_is_part_of_identity() {
+                    $crate::grant::contract::each_grant_key_component_is_part_of_identity(
+                        $factory(),
+                    )
+                    .await;
                 }
                 #[tokio::test]
                 async fn double_seal_is_already_sealed() {

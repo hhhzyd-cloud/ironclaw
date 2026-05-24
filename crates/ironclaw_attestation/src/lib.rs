@@ -33,9 +33,22 @@ mod approved_tx_hash;
 mod canonical;
 mod decoded_tx;
 mod fields;
-mod grant;
-mod ledger;
 mod rendered;
+
+// `grant` and `ledger` are private by default — their public types are
+// re-exported below. Under the `contract-tests` feature they are made public
+// so out-of-crate durable-backend crates can reach the canonical contract
+// suites at `ironclaw_attestation::grant::contract` /
+// `ironclaw_attestation::ledger::contract` (the `#[macro_export]`ed
+// `*_contract_cases!` macros expand to `$crate::grant::contract::...` paths).
+#[cfg(not(feature = "contract-tests"))]
+mod grant;
+#[cfg(feature = "contract-tests")]
+pub mod grant;
+#[cfg(not(feature = "contract-tests"))]
+mod ledger;
+#[cfg(feature = "contract-tests")]
+pub mod ledger;
 
 pub use approved_tx_hash::compute_approved_tx_hash;
 pub use canonical::canonical_signing_bytes;
