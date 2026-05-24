@@ -4378,6 +4378,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "glob",
+ "ironclaw_auth",
  "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_safety",
@@ -4820,6 +4821,7 @@ dependencies = [
  "ironclaw_extensions",
  "ironclaw_filesystem",
  "ironclaw_first_party_extension_ports",
+ "ironclaw_first_party_extensions",
  "ironclaw_host_api",
  "ironclaw_host_runtime",
  "ironclaw_llm",
