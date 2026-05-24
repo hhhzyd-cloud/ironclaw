@@ -21,13 +21,16 @@
 
 use std::sync::Arc;
 
-use ironclaw_attestation::{InMemorySealedGrantStore, InMemorySigningLedger};
+use ironclaw_attestation::{
+    AttestedSigningGrant, GrantKey, InMemorySealedGrantStore, InMemorySigningLedger,
+    SealedGrantStore,
+};
 use ironclaw_attested_runtime::{
-    AttestedSignerContinuationDriver, Broadcaster, ContinuationError,
-    InMemoryAttestedGateBindingStore, ProviderRegistry,
+    AttestedGateBinding, AttestedGateBindingStore, AttestedSignerContinuationDriver, Broadcaster,
+    ContinuationError, InMemoryAttestedGateBindingStore, ProviderRegistry,
 };
 use ironclaw_chain_signing::{CustodialSigner, DenyFirstCustodyPolicy, SecretsKeyStore, ShipGate};
-use ironclaw_signing_provider::SigningContext;
+use ironclaw_signing_provider::{GateRef, SigningContext};
 
 /// The concrete custodial signer type the local-dev composition assembles. Its
 /// generic parameters are pinned here so the rest of the runtime never names
@@ -67,6 +70,7 @@ impl Broadcaster for NoopBroadcaster {
 /// driver.
 pub struct RebornAttestedComposition {
     bindings: Arc<InMemoryAttestedGateBindingStore>,
+    grants: Arc<InMemorySealedGrantStore>,
     driver: Arc<LocalDevContinuationDriver>,
 }
 
@@ -95,13 +99,47 @@ impl RebornAttestedComposition {
             Arc::new(DenyFirstCustodyPolicy),
         ));
         let driver = Arc::new(AttestedSignerContinuationDriver::new(
-            Arc::clone(&bindings) as Arc<dyn ironclaw_attested_runtime::AttestedGateBindingStore>,
+            Arc::clone(&bindings) as Arc<dyn AttestedGateBindingStore>,
             providers,
             custodial_signer,
-            ledger,
+            Arc::clone(&ledger),
             Arc::new(NoopBroadcaster),
         ));
-        Self { bindings, driver }
+        Self {
+            bindings,
+            grants,
+            driver,
+        }
+    }
+
+    /// Persist the authoritative state when a `BlockedAttested` gate is raised
+    /// (attested-signing PR11 raise side).
+    ///
+    /// Records the authoritative [`AttestedGateBinding`] (gate_ref ∥ expected
+    /// `ApprovedTxHash` ∥ bound signer/account ∥ chain/tx-type) the resume port
+    /// and driver both read back, and seals the one-shot sealed grant the
+    /// external-wallet provider / custodial signer claims (threat #1). The
+    /// caller's later resume can only *attest* to this binding's hash — never
+    /// redefine it (threats #2 / #3 / #4).
+    ///
+    /// In-memory only (PR11); durable PG / libSQL backends are PR12.
+    pub async fn register_attested_gate(
+        &self,
+        gate_ref: GateRef,
+        binding: AttestedGateBinding,
+        created_at_ms: i64,
+        expiry_ms: Option<i64>,
+    ) -> Result<(), ironclaw_attestation::GrantError> {
+        let grant_key = GrantKey::from_context(&binding.context, binding.approved_tx_hash);
+        self.grants
+            .seal(AttestedSigningGrant::seal(
+                grant_key,
+                created_at_ms,
+                expiry_ms,
+            ))
+            .await?;
+        self.bindings.put(gate_ref, binding).await;
+        Ok(())
     }
 
     /// The authoritative gate-binding store. The PR11 ingress persists a

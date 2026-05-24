@@ -91,6 +91,14 @@ ironclaw_attested_runtime = { path = "../ironclaw_attested_runtime" }
 ironclaw_attestation = { path = "../ironclaw_attestation" }
 ironclaw_chain_signing = { path = "../ironclaw_chain_signing" }
 ironclaw_signing_provider = { path = "../ironclaw_signing_provider" }
+# External-wallet providers (PR7/PR8/PR9): the composition layer decodes the
+# WebUI attested-proof payload into the concrete provider proof and registers
+# the providers that verify it on the signer-continuation driver (PR11).
+ironclaw_wallet_external = { path = "../ironclaw_wallet_external" }
+# Concrete EVM transaction type needed only to satisfy the signer-continuation
+# driver's generic bound on the external-wallet path (which always passes
+# `None`); the custodial path is not driven by the WebUI ingress (PR11).
+alloy-consensus = "1"
 # WebUI v2 route surface — feature-gated; only used by `webui_serve`.
 ironclaw_webui_v2 = { path = "../ironclaw_webui_v2", optional = true }
 libsql = { version = "0.6", optional = true, default-features = false, features = ["core", "replication", "remote", "tls"] }
@@ -111,6 +119,11 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 async-trait = "0.1"
+# Crypto-real injected-wallet proof construction for the PR11 attested
+# gate/resolve end-to-end facade test (ed25519 Solana signature over the bound
+# hash); alloy bits build the binding's decoded-tx field.
+alloy-primitives = "1"
+ed25519-dalek = "2"
 http = "1"
 http-body-util = "0.1"
 ironclaw_host_api = { path = "../ironclaw_host_api" }

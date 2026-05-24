@@ -5752,10 +5752,13 @@ dependencies = [
 name = "ironclaw_reborn_composition"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
  "async-trait",
  "axum 0.8.9",
  "chrono",
  "deadpool-postgres",
+ "ed25519-dalek",
  "http 1.4.0",
  "http-body-util",
  "ironclaw_attestation",
@@ -5790,6 +5793,7 @@ dependencies = [
  "ironclaw_threads",
  "ironclaw_trust",
  "ironclaw_turns",
+ "ironclaw_wallet_external",
  "ironclaw_webui_v2",
  "libsql",
  "lru 0.16.4",
