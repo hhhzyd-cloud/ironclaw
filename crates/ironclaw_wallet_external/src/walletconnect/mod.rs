@@ -16,11 +16,16 @@
 //!    checked equal to it — any superset is a [`SigningProviderError::ScopeViolation`]
 //!    (threats T17/T19).
 //! 2. **Proof verification** ([`Self::verify_resume`]). Fail-closed, in order:
-//!    hash binding (T20), session + nonce binding (T18), signer binding (T17,
-//!    [`SignerMismatch`](SigningProviderError::SignerMismatch)), then the
-//!    one-shot sealed-grant CAS (T20,
-//!    [`GrantClaimFailed`](SigningProviderError::GrantClaimFailed)). Only on full
-//!    success is a [`VerifiedProof`] returned.
+//!    pinned-scope match, hash binding (T20, both proof and recorded binding),
+//!    session + nonce binding (T18), account binding, **real signed-transaction
+//!    binding** (the proof's `signed_payload` — the exact bytes the wallet's
+//!    chain signature covers — must equal the `expected_signing_payload`
+//!    recorded at initiate from the same decoded tx), signer binding over that
+//!    real signature (T17, [`SignerMismatch`](SigningProviderError::SignerMismatch)),
+//!    then the one-shot sealed-grant CAS (T20,
+//!    [`GrantClaimFailed`](SigningProviderError::GrantClaimFailed)). The recorded
+//!    binding is consumed only on full success. Only then is a [`VerifiedProof`]
+//!    returned. A signature over a synthetic digest is never accepted.
 //!
 //! ## Scope boundary (PR9 vs PR10)
 //!
@@ -52,7 +57,9 @@ use ironclaw_signing_provider::{
 // callers configure the provider with the SDK's own type (no parallel newtype).
 pub use relay_rpc::domain::ProjectId;
 
-pub use namespace::{ChainFamily, PinnedScope, ProposedScope, enforce_pinned_scope};
+pub use namespace::{
+    Caip2ChainId, Caip10Account, ChainFamily, PinnedScope, ProposedScope, enforce_pinned_scope,
+};
 pub use proof::{
     WalletConnectProofPayload, decode_walletconnect_proof, encode_walletconnect_proof,
 };
@@ -131,13 +138,16 @@ impl SigningProvider for WalletConnectSigningProvider {
         // build a pairing URI for the configured ProjectId, publish the CAIP-25
         // session proposal pinned to `pinned.caip2_chain` + `pinned.method`,
         // subscribe for the wallet's settlement, enforce `enforce_pinned_scope`
-        // against the SETTLED namespaces, mint a per-request nonce, and
+        // against the SETTLED namespaces + accounts, mint a per-request nonce,
+        // derive `expected_signing_payload` from the decoded tx via the real
+        // chain encoder (the EVM EIP-2718/RLP secp256k1 sighash / the Solana
+        // message bytes — PR10/PR11; not present in this crate), and
         // `record_session_binding(gate, SessionBinding { session_topic, account,
-        // nonce, pinned })`. The encrypted Sign envelope layer is not exposed by
-        // the relay_client fork, so the live round-trip is deferred to PR10. The
-        // pinned method that would be requested is `pinned.method`
-        // (e.g. eth_signTransaction / solana_signTransaction /
-        // near_signTransactions) — sign-only; broadcast is PR10.
+        // nonce, pinned, approved_tx_hash, expected_signing_payload })`. The
+        // encrypted Sign envelope layer is not exposed by the relay_client fork,
+        // so the live round-trip is deferred to PR10. The pinned method that
+        // would be requested is `pinned.method` (e.g. eth_signTransaction /
+        // solana_signTransaction) — sign-only; broadcast is PR10.
         let _ = (&self.project_id, pinned);
 
         // Until PR10 wires the live pairing, signal that the ceremony proceeds
@@ -168,28 +178,47 @@ impl SigningProvider for WalletConnectSigningProvider {
         // / unsupported chain id fails closed (ScopeViolation) before any crypto.
         let pinned = PinnedScope::from_chain_id(&context.chain_id)?;
 
-        // The session binding recorded at initiate. Consumed (taken) here so an
-        // in-process replay cannot reuse it; the durable one-shot guarantee is
-        // the sealed-grant CAS below (and PR10's persistence).
+        // The session binding recorded at initiate. PEEKED (not yet consumed):
+        // all hash/signature validation runs against this recorded expectation
+        // first, so a malformed relay/wallet response cannot burn the binding.
+        // It is consumed (taken) only on the success path, after the one-shot
+        // grant is claimed.
         let binding =
             self.bindings
-                .take(&context.gate_ref)
+                .peek(&context.gate_ref)
                 .ok_or(SigningProviderError::ProofInvalid {
                     reason: "no recorded walletconnect session binding for this gate".to_string(),
                 })?;
 
-        // 1. Hash binding (T20): the wallet must have attested to the exact
-        //    bound hash. Reject before any signature work.
+        // The recorded binding's pinned scope must match the gate's bound scope
+        // (defense in depth against a binding recorded under a different chain).
+        if binding.pinned != pinned {
+            return Err(SigningProviderError::ScopeViolation {
+                reason: "recorded session binding scope does not match the gate's pinned scope"
+                    .to_string(),
+            });
+        }
+
+        // 1. Hash binding (T20). The wallet's proof must carry the exact bound
+        //    hash, AND the binding recorded at initiate must have been recorded
+        //    for that same hash — neither the proof nor the binding may smuggle
+        //    a different approval.
         if &payload.approved_tx_hash != approved_tx_hash {
             return Err(SigningProviderError::ProofInvalid {
                 reason: "proof approved-tx hash does not match the bound hash".to_string(),
+            });
+        }
+        if &binding.approved_tx_hash != approved_tx_hash {
+            return Err(SigningProviderError::ProofInvalid {
+                reason: "recorded session binding hash does not match the bound hash".to_string(),
             });
         }
 
         // 2. Session + nonce binding (T18): the proof must belong to the recorded
         //    session and carry the recorded nonce. A proof minted under a
         //    different WC session / relay key, or replayed with a stale/forged
-        //    nonce, is rejected here.
+        //    nonce, is rejected here. This is an ADDITIONAL anti-replay layer on
+        //    top of the real chain-signature check below, not a replacement.
         if payload.session_topic != binding.session_topic {
             return Err(SigningProviderError::ProofInvalid {
                 reason: "proof session topic does not match the recorded session binding"
@@ -202,15 +231,6 @@ impl SigningProvider for WalletConnectSigningProvider {
             });
         }
 
-        // The recorded binding's pinned scope must match the gate's bound scope
-        // (defense in depth against a binding recorded under a different chain).
-        if binding.pinned != pinned {
-            return Err(SigningProviderError::ScopeViolation {
-                reason: "recorded session binding scope does not match the gate's pinned scope"
-                    .to_string(),
-            });
-        }
-
         // The session-bound account must equal the gate's bound account — the WC
         // session settled on the same account the grant is bound to.
         let bound_account = context.key_or_account_id.as_str();
@@ -218,23 +238,41 @@ impl SigningProvider for WalletConnectSigningProvider {
             return Err(SigningProviderError::SignerMismatch);
         }
 
-        // 3. Signer binding (T17): verify the signature over the domain-separated
-        //    attestation digest (which commits to hash ∥ session topic ∥ nonce)
-        //    and require the resolved signer to equal the bound account.
-        let digest =
-            signer::attestation_digest(approved_tx_hash, &binding.session_topic, &binding.nonce);
-        signer::verify_attestation(
+        // 3. Real signed-transaction binding (#1, T20). The proof carries the
+        //    EXACT bytes the wallet's chain signature covers (`signed_payload` —
+        //    the EVM secp256k1 sighash / the Solana ed25519 message returned by
+        //    eth_signTransaction / solana_signTransaction). Bind those bytes back
+        //    to what the human approved by requiring them to equal the
+        //    `expected_signing_payload` recorded at initiate from the SAME
+        //    decoded transaction that produced `approved_tx_hash`. A wallet that
+        //    signed *different* bytes than the approved transaction is rejected
+        //    here — the synthetic-digest acceptance is gone.
+        if payload.signed_payload != binding.expected_signing_payload {
+            return Err(SigningProviderError::ProofInvalid {
+                reason: "proof signed payload does not match the approved transaction bytes"
+                    .to_string(),
+            });
+        }
+
+        // 4. Signer binding (T17): verify the wallet's REAL chain signature over
+        //    `signed_payload` and require the recovered/verified signer to equal
+        //    the bound account.
+        signer::verify_chain_signature(
             pinned.family,
-            &digest,
+            &payload.signed_payload,
             &payload.signature,
             payload.public_key.as_deref(),
             bound_account,
         )?;
 
-        // 4. One-shot grant (T20): claim the sealed grant atomically. A replay of
+        // 5. One-shot grant (T20): claim the sealed grant atomically. A replay of
         //    an already-claimed grant fails closed here.
         let key = GrantKey::from_context(context, *approved_tx_hash);
         self.grants.claim(&key).await.map_err(map_grant_error)?;
+
+        // Consume the binding only now that every check (incl. the durable grant
+        // CAS) has passed — a malformed earlier response never burned it.
+        let _ = self.bindings.take(&context.gate_ref);
 
         // PR10: hand the verified proof back to the gate / runner for the
         // deterministic post-approval continuation (broadcast via
@@ -251,17 +289,6 @@ fn map_grant_error(err: GrantError) -> SigningProviderError {
         }
         GrantError::Backend { reason } => SigningProviderError::Provider { reason },
     }
-}
-
-/// Expose the digest + binding constructor for integration tests that mint a
-/// wallet signature over the exact bytes the verifier expects.
-#[doc(hidden)]
-pub fn attestation_digest_for_test(
-    approved_tx_hash: &ApprovedTxHash,
-    session_topic: &str,
-    nonce: &[u8],
-) -> [u8; 32] {
-    signer::attestation_digest(approved_tx_hash, session_topic, nonce)
 }
 
 /// Hex (de)serialization helpers shared by the proof payload fields.
@@ -286,14 +313,35 @@ pub(crate) mod hex_bytes {
         out
     }
 
+    /// Decode `0x`-prefixed hex into bytes, panic-free on any input.
+    ///
+    /// Operates on **bytes**, never on `&str` byte-offset slices: a non-ASCII
+    /// even-byte input would make byte-offset slicing land on an invalid UTF-8
+    /// boundary and panic. Non-ASCII / non-hex bytes are rejected as
+    /// `ProofInvalid`-grade errors so relay/wallet-supplied hex fails closed
+    /// (#3).
     pub(crate) fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
         let s = s.strip_prefix("0x").unwrap_or(s);
-        if !s.len().is_multiple_of(2) {
+        let bytes = s.as_bytes();
+        if !bytes.len().is_multiple_of(2) {
             return Err("odd-length hex".to_string());
         }
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
-            .collect()
+        let mut out = Vec::with_capacity(bytes.len() / 2);
+        for chunk in bytes.chunks_exact(2) {
+            let hi = nibble(chunk[0])?;
+            let lo = nibble(chunk[1])?;
+            out.push((hi << 4) | lo);
+        }
+        Ok(out)
+    }
+
+    /// Map a single ASCII hex digit byte to its nibble value.
+    fn nibble(b: u8) -> Result<u8, String> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            other => Err(format!("invalid hex byte 0x{other:02x}")),
+        }
     }
 }

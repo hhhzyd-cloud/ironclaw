@@ -19,6 +19,116 @@
 
 use ironclaw_signing_provider::{ChainId, SigningProviderError};
 
+/// A parsed CAIP-2 chain id (`namespace:reference`).
+///
+/// Parsed via a real CAIP-2 grammar check (not a bare `split_once`): exactly one
+/// `:`, a non-empty `[-a-z0-9]{3,8}` namespace, and a non-empty
+/// `[-_a-zA-Z0-9]{1,32}` reference. Anything else is rejected fail-closed so a
+/// malformed/relay-supplied chain id can never be coerced into a family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Caip2ChainId {
+    /// The full `namespace:reference` string.
+    full: String,
+    /// Byte length of the namespace (the part before the single `:`).
+    ns_len: usize,
+}
+
+impl Caip2ChainId {
+    /// Parse and validate a CAIP-2 chain id.
+    pub fn parse(s: &str) -> Result<Self, SigningProviderError> {
+        let viol = |reason: String| SigningProviderError::ScopeViolation { reason };
+        let (ns, reference) = s.split_once(':').ok_or_else(|| {
+            viol(format!(
+                "chain id `{s}` is not a CAIP-2 `namespace:reference`"
+            ))
+        })?;
+        // Reject a second `:` (a bare split_once would silently accept it).
+        if reference.contains(':') {
+            return Err(viol(format!("chain id `{s}` has more than one `:`")));
+        }
+        if !(3..=8).contains(&ns.len())
+            || !ns
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(viol(format!(
+                "chain id `{s}` has an invalid CAIP-2 namespace"
+            )));
+        }
+        if !(1..=32).contains(&reference.len())
+            || !reference
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(viol(format!(
+                "chain id `{s}` has an invalid CAIP-2 reference"
+            )));
+        }
+        Ok(Self {
+            full: s.to_string(),
+            ns_len: ns.len(),
+        })
+    }
+
+    /// The CAIP-2 namespace (the part before the `:`), e.g. `eip155`.
+    pub fn namespace(&self) -> &str {
+        &self.full[..self.ns_len]
+    }
+
+    /// The full `namespace:reference` string.
+    pub fn as_str(&self) -> &str {
+        &self.full
+    }
+}
+
+/// A parsed CAIP-10 account id (`namespace:reference:address` =
+/// `caip2_chain:address`).
+///
+/// Binds an account to the EXACT chain it lives on. Parsing settled accounts as
+/// typed CAIP-10 (rather than treating them as raw strings) lets the verifier
+/// prove the WC account is `eip155:1:<addr>` and not the same address on another
+/// chain (#2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Caip10Account {
+    /// The CAIP-2 chain id the account lives on.
+    chain: Caip2ChainId,
+    /// The account address component (chain-specific; normalized only for the
+    /// signer comparison, not here).
+    address: String,
+}
+
+impl Caip10Account {
+    /// Parse and validate a CAIP-10 account id `caip2_chain:address`.
+    pub fn parse(s: &str) -> Result<Self, SigningProviderError> {
+        let viol = |reason: String| SigningProviderError::ScopeViolation { reason };
+        // CAIP-10 = `namespace:reference:account_address`. Split off the address
+        // (last `:` segment); the remainder must be a valid CAIP-2 chain id.
+        let (chain_part, address) = s
+            .rsplit_once(':')
+            .ok_or_else(|| viol(format!("account `{s}` is not a CAIP-10 `chain:address`")))?;
+        if address.is_empty() {
+            return Err(viol(format!(
+                "account `{s}` has an empty address component"
+            )));
+        }
+        let chain = Caip2ChainId::parse(chain_part)?;
+        Ok(Self {
+            chain,
+            address: address.to_string(),
+        })
+    }
+
+    /// The CAIP-2 chain id this account is pinned to.
+    pub fn chain_id(&self) -> &Caip2ChainId {
+        &self.chain
+    }
+
+    /// The address component (chain-specific; normalize for signer comparison).
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+}
+
 /// The wallet/crypto family a CAIP-2 chain id belongs to.
 ///
 /// Determines which signing RPC method and which signer-recovery scheme apply.
@@ -30,9 +140,6 @@ pub enum ChainFamily {
     /// Solana clusters (`solana:*`). Signs via `solana_signTransaction`; signer
     /// is the connected ed25519 account.
     Solana,
-    /// NEAR networks (`near:*`). Signs via `near_signTransactions`; signer is
-    /// the connected ed25519 account.
-    Near,
 }
 
 impl ChainFamily {
@@ -48,7 +155,6 @@ impl ChainFamily {
         match self {
             ChainFamily::Evm => "eth_signTransaction",
             ChainFamily::Solana => "solana_signTransaction",
-            ChainFamily::Near => "near_signTransactions",
         }
     }
 }
@@ -57,8 +163,8 @@ impl ChainFamily {
 /// carry for this gate. Anything broader is a [`SigningProviderError::ScopeViolation`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedScope {
-    /// The exact CAIP-2 chain id (e.g. `eip155:1`, `solana:5eykt4...`).
-    pub caip2_chain: String,
+    /// The exact, typed CAIP-2 chain id (e.g. `eip155:1`, `solana:5eykt4...`).
+    pub caip2_chain: Caip2ChainId,
     /// The chain family resolved from the CAIP-2 namespace.
     pub family: ChainFamily,
     /// The single signing RPC method permitted.
@@ -73,16 +179,20 @@ impl PinnedScope {
     /// the single permitted chain; the family selects the single permitted
     /// signing method.
     pub fn from_chain_id(chain_id: &ChainId) -> Result<Self, SigningProviderError> {
-        let caip2 = chain_id.as_str();
-        let namespace = caip2.split_once(':').map(|(ns, _)| ns).ok_or_else(|| {
-            SigningProviderError::ScopeViolation {
-                reason: format!("chain id `{caip2}` is not a CAIP-2 `namespace:reference`"),
-            }
-        })?;
-        let family = match namespace {
+        let caip2 = Caip2ChainId::parse(chain_id.as_str())?;
+        let family = match caip2.namespace() {
             "eip155" => ChainFamily::Evm,
             "solana" => ChainFamily::Solana,
-            "near" => ChainFamily::Near,
+            // NEAR is explicitly unsupported on the WalletConnect provider until
+            // a real NEAR account/signature verifier exists. Fail-closed rather
+            // than accept a chain we cannot verify a signer for.
+            "near" => {
+                return Err(SigningProviderError::ScopeViolation {
+                    reason:
+                        "CAIP-2 namespace `near` is not supported by the walletconnect provider"
+                            .to_string(),
+                });
+            }
             other => {
                 return Err(SigningProviderError::ScopeViolation {
                     reason: format!("unsupported CAIP-2 namespace `{other}`"),
@@ -90,18 +200,20 @@ impl PinnedScope {
             }
         };
         Ok(Self {
-            caip2_chain: caip2.to_string(),
             family,
             method: family.signing_method().to_string(),
+            caip2_chain: caip2,
         })
     }
 
     /// The CAIP-2 namespace (the part before the first `:`), e.g. `eip155`.
     pub fn namespace(&self) -> &str {
-        self.caip2_chain
-            .split_once(':')
-            .map(|(ns, _)| ns)
-            .unwrap_or(&self.caip2_chain)
+        self.caip2_chain.namespace()
+    }
+
+    /// The pinned CAIP-2 chain id as a string.
+    pub fn chain_str(&self) -> &str {
+        self.caip2_chain.as_str()
     }
 }
 
@@ -111,12 +223,17 @@ impl PinnedScope {
 /// Mirrors the CAIP-25 `chains` / `methods` arrays of a single namespace.
 /// Modeled minimally here (PR9 verifies the negotiated scope; the encrypted
 /// CAIP-25 envelope round-trip over the relay is PR10).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProposedScope {
     /// CAIP-2 chain ids the session would authorize.
     pub chains: Vec<String>,
     /// RPC methods the session would authorize.
     pub methods: Vec<String>,
+    /// CAIP-10 accounts the session settled on. Each is parsed as a typed
+    /// CAIP-10 account and required to live on exactly the pinned CAIP-2 chain
+    /// (#2). Empty is permitted for a pure *proposal* (pre-settlement) but
+    /// rejected for a settled scope by [`enforce_pinned_scope`] when present.
+    pub accounts: Vec<String>,
 }
 
 /// Validate a proposed/settled session scope against the gate's pinned scope,
@@ -135,34 +252,51 @@ pub fn enforce_pinned_scope(
     pinned: &PinnedScope,
     proposed: &ProposedScope,
 ) -> Result<(), SigningProviderError> {
-    if proposed.chains.is_empty() {
-        return Err(SigningProviderError::ScopeViolation {
-            reason: "session proposal authorizes no chains".to_string(),
-        });
+    let viol = |reason: String| SigningProviderError::ScopeViolation { reason };
+
+    // Singleton-exact: exactly one chain and exactly one method, both equal to
+    // the pinned values. A length != 1 is either empty (authorizes nothing) or a
+    // duplicate/superset (scope broadening) — both fail closed (T17/T19).
+    if proposed.chains.len() != 1 {
+        return Err(viol(format!(
+            "session scope must authorize exactly one chain, got {}",
+            proposed.chains.len()
+        )));
     }
-    if proposed.methods.is_empty() {
-        return Err(SigningProviderError::ScopeViolation {
-            reason: "session proposal authorizes no methods".to_string(),
-        });
+    if proposed.methods.len() != 1 {
+        return Err(viol(format!(
+            "session scope must authorize exactly one method, got {}",
+            proposed.methods.len()
+        )));
     }
-    for chain in &proposed.chains {
-        if chain != &pinned.caip2_chain {
-            return Err(SigningProviderError::ScopeViolation {
-                reason: format!(
-                    "session proposal chain `{chain}` broadens scope beyond the pinned chain `{}`",
-                    pinned.caip2_chain
-                ),
-            });
-        }
+    // Compare the chain via the typed CAIP-2 parser, not a raw string compare:
+    // a malformed chain id can never silently equal the pinned chain.
+    let proposed_chain = Caip2ChainId::parse(&proposed.chains[0])?;
+    if proposed_chain != pinned.caip2_chain {
+        return Err(viol(format!(
+            "session scope chain `{}` broadens scope beyond the pinned chain `{}`",
+            proposed.chains[0],
+            pinned.chain_str()
+        )));
     }
-    for method in &proposed.methods {
-        if method != &pinned.method {
-            return Err(SigningProviderError::ScopeViolation {
-                reason: format!(
-                    "session proposal method `{method}` broadens scope beyond the pinned method `{}`",
-                    pinned.method
-                ),
-            });
+    if proposed.methods[0] != pinned.method {
+        return Err(viol(format!(
+            "session scope method `{}` broadens scope beyond the pinned method `{}`",
+            proposed.methods[0], pinned.method
+        )));
+    }
+
+    // Accounts (#2): every settled account must be a typed CAIP-10 account that
+    // lives on EXACTLY the pinned CAIP-2 chain. A `proposal` (pre-settlement)
+    // may carry no accounts; a settled scope that lists accounts must bind them
+    // all to the pinned chain.
+    for account in &proposed.accounts {
+        let parsed = Caip10Account::parse(account)?;
+        if parsed.chain_id() != &pinned.caip2_chain {
+            return Err(viol(format!(
+                "settled account `{account}` is not on the pinned chain `{}`",
+                pinned.chain_str()
+            )));
         }
     }
     Ok(())
@@ -178,23 +312,82 @@ mod tests {
         assert_eq!(pinned.family, ChainFamily::Evm);
         assert_eq!(pinned.method, "eth_signTransaction");
         assert_eq!(pinned.namespace(), "eip155");
-        assert_eq!(pinned.caip2_chain, "eip155:1");
+        assert_eq!(pinned.chain_str(), "eip155:1");
     }
 
     #[test]
-    fn resolves_solana_and_near_families() {
+    fn resolves_solana_family() {
         assert_eq!(
             PinnedScope::from_chain_id(&ChainId::new("solana:mainnet"))
                 .expect("sol")
                 .method,
             "solana_signTransaction"
         );
-        assert_eq!(
-            PinnedScope::from_chain_id(&ChainId::new("near:mainnet"))
-                .expect("near")
-                .method,
-            "near_signTransactions"
-        );
+    }
+
+    #[test]
+    fn near_is_explicitly_unsupported() {
+        let err = PinnedScope::from_chain_id(&ChainId::new("near:mainnet"))
+            .expect_err("near unsupported");
+        assert!(matches!(err, SigningProviderError::ScopeViolation { .. }));
+    }
+
+    #[test]
+    fn multi_colon_chain_id_is_rejected() {
+        let err =
+            Caip2ChainId::parse("eip155:1:extra").expect_err("more than one colon must reject");
+        assert!(matches!(err, SigningProviderError::ScopeViolation { .. }));
+    }
+
+    #[test]
+    fn caip10_account_wrong_chain_is_rejected() {
+        let pinned = PinnedScope::from_chain_id(&ChainId::new("eip155:1")).expect("evm");
+        let proposed = ProposedScope {
+            chains: vec!["eip155:1".to_string()],
+            methods: vec!["eth_signTransaction".to_string()],
+            // Same address, WRONG chain.
+            accounts: vec!["eip155:137:0x00000000000000000000000000000000000000aa".to_string()],
+        };
+        let err = enforce_pinned_scope(&pinned, &proposed).expect_err("wrong-chain account");
+        assert!(matches!(err, SigningProviderError::ScopeViolation { .. }));
+    }
+
+    #[test]
+    fn caip10_account_on_pinned_chain_is_accepted() {
+        let pinned = PinnedScope::from_chain_id(&ChainId::new("eip155:1")).expect("evm");
+        let proposed = ProposedScope {
+            chains: vec!["eip155:1".to_string()],
+            methods: vec!["eth_signTransaction".to_string()],
+            accounts: vec!["eip155:1:0x00000000000000000000000000000000000000aa".to_string()],
+        };
+        enforce_pinned_scope(&pinned, &proposed).expect("matching-chain account accepted");
+    }
+
+    #[test]
+    fn duplicate_chain_array_is_rejected() {
+        let pinned = PinnedScope::from_chain_id(&ChainId::new("eip155:1")).expect("evm");
+        let proposed = ProposedScope {
+            chains: vec!["eip155:1".to_string(), "eip155:1".to_string()],
+            methods: vec!["eth_signTransaction".to_string()],
+            accounts: vec![],
+        };
+        let err = enforce_pinned_scope(&pinned, &proposed).expect_err("duplicate chain");
+        assert!(matches!(err, SigningProviderError::ScopeViolation { .. }));
+    }
+
+    #[test]
+    fn duplicate_method_array_is_rejected() {
+        let pinned = PinnedScope::from_chain_id(&ChainId::new("eip155:1")).expect("evm");
+        let proposed = ProposedScope {
+            chains: vec!["eip155:1".to_string()],
+            methods: vec![
+                "eth_signTransaction".to_string(),
+                "eth_signTransaction".to_string(),
+            ],
+            accounts: vec![],
+        };
+        let err = enforce_pinned_scope(&pinned, &proposed).expect_err("duplicate method");
+        assert!(matches!(err, SigningProviderError::ScopeViolation { .. }));
     }
 
     #[test]
@@ -219,6 +412,7 @@ mod tests {
         let proposed = ProposedScope {
             chains: vec!["eip155:1".to_string()],
             methods: vec!["eth_signTransaction".to_string()],
+            accounts: vec![],
         };
         enforce_pinned_scope(&evm_pinned(), &proposed).expect("exact match accepted");
     }
@@ -228,6 +422,7 @@ mod tests {
         let proposed = ProposedScope {
             chains: vec!["eip155:1".to_string(), "eip155:137".to_string()],
             methods: vec!["eth_signTransaction".to_string()],
+            accounts: vec![],
         };
         let err = enforce_pinned_scope(&evm_pinned(), &proposed).expect_err("extra chain");
         assert!(matches!(err, SigningProviderError::ScopeViolation { .. }));
@@ -241,6 +436,7 @@ mod tests {
                 "eth_signTransaction".to_string(),
                 "eth_sendTransaction".to_string(),
             ],
+            accounts: vec![],
         };
         let err = enforce_pinned_scope(&evm_pinned(), &proposed).expect_err("extra method");
         assert!(matches!(err, SigningProviderError::ScopeViolation { .. }));
@@ -251,6 +447,7 @@ mod tests {
         let proposed = ProposedScope {
             chains: vec!["eip155:137".to_string()],
             methods: vec!["eth_signTransaction".to_string()],
+            accounts: vec![],
         };
         let err = enforce_pinned_scope(&evm_pinned(), &proposed).expect_err("wrong chain");
         assert!(matches!(err, SigningProviderError::ScopeViolation { .. }));
@@ -261,6 +458,7 @@ mod tests {
         let no_chains = ProposedScope {
             chains: vec![],
             methods: vec!["eth_signTransaction".to_string()],
+            accounts: vec![],
         };
         assert!(matches!(
             enforce_pinned_scope(&evm_pinned(), &no_chains).expect_err("no chains"),
@@ -269,6 +467,7 @@ mod tests {
         let no_methods = ProposedScope {
             chains: vec!["eip155:1".to_string()],
             methods: vec![],
+            accounts: vec![],
         };
         assert!(matches!(
             enforce_pinned_scope(&evm_pinned(), &no_methods).expect_err("no methods"),

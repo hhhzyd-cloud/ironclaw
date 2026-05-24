@@ -63,7 +63,7 @@ pub use injected::{
     encode_injected_proof,
 };
 pub use walletconnect::{
-    ChainFamily, PinnedScope, ProjectId, ProposedScope, SessionBinding, SessionBindingStore,
-    WalletConnectProofPayload, WalletConnectSigningProvider, attestation_digest_for_test,
+    Caip2ChainId, Caip10Account, ChainFamily, PinnedScope, ProjectId, ProposedScope,
+    SessionBinding, SessionBindingStore, WalletConnectProofPayload, WalletConnectSigningProvider,
     decode_walletconnect_proof, encode_walletconnect_proof, enforce_pinned_scope,
 };

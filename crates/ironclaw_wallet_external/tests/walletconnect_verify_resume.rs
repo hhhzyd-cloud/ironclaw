@@ -5,16 +5,21 @@
 //! through the sealed-grant store + recorded session binding, exercising the
 //! full fail-closed contract:
 //!
-//! * namespace pinning rejects scope broadening (T17/T19);
-//! * a valid signature from the session-bound account over the bound hash →
-//!   `VerifiedProof`;
+//! * namespace pinning rejects scope broadening + wrong-chain CAIP-10 accounts
+//!   + duplicate scope arrays (T17/T19, #2);
+//! * a valid REAL chain signature over the REAL signed-tx payload from the
+//!   session-bound account, where that payload equals the
+//!   `expected_signing_payload` recorded at initiate → `VerifiedProof` (#1);
 //! * a tampered hash, a wrong session topic / nonce (T18), a mismatched signer
-//!   (T17), and a replayed / already-claimed grant (T20) all fail closed.
+//!   (T17), a payload that differs from the approved bytes (#1), a malformed
+//!   Unicode-hex account (#3), and a replayed / already-claimed grant (T20) all
+//!   fail closed.
 //!
 //! The relay is never contacted: the session binding `initiate` would record
-//! over the relay (PR10) is installed directly via `record_session_binding`,
-//! and the wallet signature is minted in-test over the exact domain-separated
-//! digest the verifier recomputes.
+//! over the relay (PR10) — including the `expected_signing_payload` PR10/PR11's
+//! chain encoder will derive — is installed directly via `record_session_binding`,
+//! and the wallet signature is minted in-test over the exact `signed_payload`
+//! fixture the verifier checks. No synthetic attestation digest exists anymore.
 
 use std::sync::Arc;
 
@@ -27,8 +32,7 @@ use ironclaw_signing_provider::{
 };
 use ironclaw_wallet_external::{
     PinnedScope, ProjectId, ProposedScope, SessionBinding, WalletConnectProofPayload,
-    WalletConnectSigningProvider, attestation_digest_for_test, encode_walletconnect_proof,
-    enforce_pinned_scope,
+    WalletConnectSigningProvider, encode_walletconnect_proof, enforce_pinned_scope,
 };
 
 use ed25519_dalek::{Signer as _, SigningKey as EdSigningKey};
@@ -52,6 +56,25 @@ fn lower_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// A stand-in for the EVM secp256k1 sighash a real `eth_signTransaction` would
+/// cover. In production PR10/PR11 derives this from the decoded tx via a real
+/// EIP-2718/RLP encoder; here it is a fixed 32-byte fixture the wallet signs and
+/// the binding records as `expected_signing_payload`.
+fn evm_sighash_fixture() -> [u8; 32] {
+    let mut h = Keccak256::new();
+    h.update(b"real-evm-signing-payload-fixture");
+    let out = h.finalize();
+    let mut sighash = [0u8; 32];
+    sighash.copy_from_slice(&out);
+    sighash
+}
+
+/// A stand-in for the Solana ed25519 message bytes a real
+/// `solana_signTransaction` would cover.
+fn solana_message_fixture() -> Vec<u8> {
+    b"real-solana-signing-message-fixture-bytes".to_vec()
+}
+
 // ── EVM helpers ──
 
 fn evm_key() -> EcSigningKey {
@@ -67,10 +90,10 @@ fn evm_address(key: &EcSigningKey) -> [u8; 20] {
     addr
 }
 
-/// 65-byte (r ∥ s ∥ v) signature over the 32-byte attestation digest.
-fn evm_sign_digest(key: &EcSigningKey, digest: &[u8; 32]) -> Vec<u8> {
+/// 65-byte (r ∥ s ∥ v) signature over the 32-byte sighash payload.
+fn evm_sign_payload(key: &EcSigningKey, payload: &[u8; 32]) -> Vec<u8> {
     let (sig, recid): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) =
-        key.sign_prehash(digest.as_slice()).expect("sign");
+        key.sign_prehash(payload.as_slice()).expect("sign");
     let mut out = sig.to_bytes().to_vec();
     out.push(recid.to_byte());
     out
@@ -105,16 +128,25 @@ async fn seal_grant(store: &InMemorySealedGrantStore, ctx: &SigningContext, hash
         .expect("seal");
 }
 
-fn binding_for(account: &str, chain: &str) -> SessionBinding {
+/// Build a binding whose `expected_signing_payload` is the real bytes the
+/// wallet will sign, recorded at initiate from the same decoded tx as `hash`.
+fn binding_for(
+    account: &str,
+    chain: &str,
+    hash: ApprovedTxHash,
+    expected_signing_payload: Vec<u8>,
+) -> SessionBinding {
     SessionBinding {
         session_topic: SESSION_TOPIC.to_string(),
         account: account.to_string(),
         nonce: NONCE.to_vec(),
         pinned: PinnedScope::from_chain_id(&ChainId::new(chain)).expect("pinned"),
+        approved_tx_hash: hash,
+        expected_signing_payload,
     }
 }
 
-// ── Namespace pinning (T17/T19) ──
+// ── Namespace pinning (T17/T19, #2) ──
 
 #[test]
 fn pinning_accepts_exact_scope_and_rejects_broadening() {
@@ -124,6 +156,7 @@ fn pinning_accepts_exact_scope_and_rejects_broadening() {
         &ProposedScope {
             chains: vec!["eip155:1".to_string()],
             methods: vec!["eth_signTransaction".to_string()],
+            accounts: vec!["eip155:1:0x00000000000000000000000000000000000000aa".to_string()],
         },
     )
     .expect("exact scope accepted");
@@ -135,6 +168,7 @@ fn pinning_accepts_exact_scope_and_rejects_broadening() {
             &ProposedScope {
                 chains: vec!["eip155:1".to_string(), "eip155:10".to_string()],
                 methods: vec!["eth_signTransaction".to_string()],
+                accounts: vec![],
             },
         )
         .expect_err("broader chains rejected"),
@@ -151,6 +185,7 @@ fn pinning_accepts_exact_scope_and_rejects_broadening() {
                     "eth_signTransaction".to_string(),
                     "eth_sendTransaction".to_string(),
                 ],
+                accounts: vec![],
             },
         )
         .expect_err("broader methods rejected"),
@@ -158,7 +193,58 @@ fn pinning_accepts_exact_scope_and_rejects_broadening() {
     ));
 }
 
-// ── verify_resume: EVM ──
+#[test]
+fn pinning_rejects_wrong_chain_caip10_account() {
+    let pinned = PinnedScope::from_chain_id(&ChainId::new("eip155:1")).expect("evm");
+    // Same address, different chain — must be rejected (#2).
+    let err = enforce_pinned_scope(
+        &pinned,
+        &ProposedScope {
+            chains: vec!["eip155:1".to_string()],
+            methods: vec!["eth_signTransaction".to_string()],
+            accounts: vec!["eip155:137:0x00000000000000000000000000000000000000aa".to_string()],
+        },
+    )
+    .expect_err("wrong-chain account rejected");
+    assert!(matches!(err, SigningProviderError::ScopeViolation { .. }));
+}
+
+#[test]
+fn pinning_rejects_duplicate_scope_arrays() {
+    let pinned = PinnedScope::from_chain_id(&ChainId::new("eip155:1")).expect("evm");
+    let dup_chain = enforce_pinned_scope(
+        &pinned,
+        &ProposedScope {
+            chains: vec!["eip155:1".to_string(), "eip155:1".to_string()],
+            methods: vec!["eth_signTransaction".to_string()],
+            accounts: vec![],
+        },
+    )
+    .expect_err("duplicate chain rejected");
+    assert!(matches!(
+        dup_chain,
+        SigningProviderError::ScopeViolation { .. }
+    ));
+
+    let dup_method = enforce_pinned_scope(
+        &pinned,
+        &ProposedScope {
+            chains: vec!["eip155:1".to_string()],
+            methods: vec![
+                "eth_signTransaction".to_string(),
+                "eth_signTransaction".to_string(),
+            ],
+            accounts: vec![],
+        },
+    )
+    .expect_err("duplicate method rejected");
+    assert!(matches!(
+        dup_method,
+        SigningProviderError::ScopeViolation { .. }
+    ));
+}
+
+// ── verify_resume: EVM (real signed-tx payload, #1) ──
 
 fn evm_proof(
     key: &EcSigningKey,
@@ -166,21 +252,28 @@ fn evm_proof(
     hash: ApprovedTxHash,
     topic: &str,
     nonce: &[u8],
+    signed_payload: Vec<u8>,
 ) -> SigningProof {
-    let digest = attestation_digest_for_test(&hash, topic, nonce);
+    // Sign the REAL payload bytes (the secp256k1 sighash), exactly as
+    // eth_signTransaction would. There is no synthetic attestation digest.
+    let sighash: [u8; 32] = signed_payload
+        .clone()
+        .try_into()
+        .expect("evm signed payload is a 32-byte sighash");
     let payload = WalletConnectProofPayload {
         session_topic: topic.to_string(),
         approved_tx_hash: hash,
         claimed_signer: account.to_string(),
         nonce: nonce.to_vec(),
-        signature: evm_sign_digest(key, &digest),
+        signed_payload,
+        signature: evm_sign_payload(key, &sighash),
         public_key: None,
     };
     SigningProof::WalletConnectProof(encode_walletconnect_proof(&payload))
 }
 
 #[tokio::test]
-async fn evm_valid_proof_from_session_bound_account_verifies() {
+async fn evm_valid_proof_over_real_signed_tx_verifies() {
     let store = Arc::new(InMemorySealedGrantStore::new());
     let provider = WalletConnectSigningProvider::new(project(), store.clone());
 
@@ -188,16 +281,50 @@ async fn evm_valid_proof_from_session_bound_account_verifies() {
     let account = format!("0x{}", lower_hex(&evm_address(&key)));
     let ctx = ctx_for(&account, "eip155:1");
     let hash = ApprovedTxHash::from_bytes([7u8; 32]);
+    let signed = evm_sighash_fixture();
     seal_grant(&store, &ctx, hash).await;
-    provider.record_session_binding(&ctx.gate_ref, binding_for(&account, "eip155:1"));
+    provider.record_session_binding(
+        &ctx.gate_ref,
+        binding_for(&account, "eip155:1", hash, signed.to_vec()),
+    );
 
-    let proof = evm_proof(&key, &account, hash, SESSION_TOPIC, NONCE);
+    let proof = evm_proof(&key, &account, hash, SESSION_TOPIC, NONCE, signed.to_vec());
     let provider: Arc<dyn SigningProvider> = Arc::new(provider);
     let verified = provider
         .verify_resume(&ctx, &hash, &proof)
         .await
-        .expect("valid evm walletconnect proof must verify");
+        .expect("valid evm walletconnect proof over the real signed tx must verify");
     assert_eq!(verified.proof(), &proof);
+}
+
+#[tokio::test]
+async fn evm_payload_not_matching_approved_bytes_is_rejected() {
+    let store = Arc::new(InMemorySealedGrantStore::new());
+    let provider = WalletConnectSigningProvider::new(project(), store.clone());
+
+    let key = evm_key();
+    let account = format!("0x{}", lower_hex(&evm_address(&key)));
+    let ctx = ctx_for(&account, "eip155:1");
+    let hash = ApprovedTxHash::from_bytes([7u8; 32]);
+    let approved = evm_sighash_fixture();
+    seal_grant(&store, &ctx, hash).await;
+    // Binding records the APPROVED payload.
+    provider.record_session_binding(
+        &ctx.gate_ref,
+        binding_for(&account, "eip155:1", hash, approved.to_vec()),
+    );
+
+    // Wallet signs a DIFFERENT transaction than the approved one (the core #1
+    // attack: a validly-signed but unapproved tx). The signature is valid for
+    // the bound account over `other`, but `other != expected_signing_payload`.
+    let mut other = approved;
+    other[0] ^= 0xff;
+    let proof = evm_proof(&key, &account, hash, SESSION_TOPIC, NONCE, other.to_vec());
+    let err = provider
+        .verify_resume(&ctx, &hash, &proof)
+        .await
+        .expect_err("signed payload != approved bytes must fail closed");
+    assert!(matches!(err, SigningProviderError::ProofInvalid { .. }));
 }
 
 #[tokio::test]
@@ -206,17 +333,28 @@ async fn evm_signer_not_bound_account_is_signer_mismatch() {
     let provider = WalletConnectSigningProvider::new(project(), store.clone());
 
     let key = evm_key();
-    // Bind a different account than the session settled on / the key recovers to.
+    // Bind a different account than the key recovers to, but record the binding
+    // on the REAL signing account so the account-binding check passes and we
+    // reach the signer recovery (which must mismatch the gate's bound account).
     let wrong = "0x00000000000000000000000000000000000000bb";
     let ctx = ctx_for(wrong, "eip155:1");
     let hash = ApprovedTxHash::from_bytes([7u8; 32]);
+    let signed = evm_sighash_fixture();
     seal_grant(&store, &ctx, hash).await;
-    // Binding records the *real* signing account, which differs from the bound
-    // account → signer-binding check fails closed.
     let real_account = format!("0x{}", lower_hex(&evm_address(&key)));
-    provider.record_session_binding(&ctx.gate_ref, binding_for(&real_account, "eip155:1"));
+    provider.record_session_binding(
+        &ctx.gate_ref,
+        binding_for(&real_account, "eip155:1", hash, signed.to_vec()),
+    );
 
-    let proof = evm_proof(&key, &real_account, hash, SESSION_TOPIC, NONCE);
+    let proof = evm_proof(
+        &key,
+        &real_account,
+        hash,
+        SESSION_TOPIC,
+        NONCE,
+        signed.to_vec(),
+    );
     let err = provider
         .verify_resume(&ctx, &hash, &proof)
         .await
@@ -233,12 +371,23 @@ async fn evm_tampered_hash_is_proof_invalid() {
     let account = format!("0x{}", lower_hex(&evm_address(&key)));
     let ctx = ctx_for(&account, "eip155:1");
     let bound_hash = ApprovedTxHash::from_bytes([7u8; 32]);
+    let signed = evm_sighash_fixture();
     seal_grant(&store, &ctx, bound_hash).await;
-    provider.record_session_binding(&ctx.gate_ref, binding_for(&account, "eip155:1"));
+    provider.record_session_binding(
+        &ctx.gate_ref,
+        binding_for(&account, "eip155:1", bound_hash, signed.to_vec()),
+    );
 
     // Wallet attests to a DIFFERENT hash than the gate bound.
     let attested = ApprovedTxHash::from_bytes([9u8; 32]);
-    let proof = evm_proof(&key, &account, attested, SESSION_TOPIC, NONCE);
+    let proof = evm_proof(
+        &key,
+        &account,
+        attested,
+        SESSION_TOPIC,
+        NONCE,
+        signed.to_vec(),
+    );
     let err = provider
         .verify_resume(&ctx, &bound_hash, &proof)
         .await
@@ -255,11 +404,15 @@ async fn evm_wrong_session_topic_is_rejected_t18() {
     let account = format!("0x{}", lower_hex(&evm_address(&key)));
     let ctx = ctx_for(&account, "eip155:1");
     let hash = ApprovedTxHash::from_bytes([7u8; 32]);
+    let signed = evm_sighash_fixture();
     seal_grant(&store, &ctx, hash).await;
-    provider.record_session_binding(&ctx.gate_ref, binding_for(&account, "eip155:1"));
+    provider.record_session_binding(
+        &ctx.gate_ref,
+        binding_for(&account, "eip155:1", hash, signed.to_vec()),
+    );
 
     // Proof minted under a DIFFERENT session topic (relay/session compromise).
-    let proof = evm_proof(&key, &account, hash, "deadbeef", NONCE);
+    let proof = evm_proof(&key, &account, hash, "deadbeef", NONCE, signed.to_vec());
     let err = provider
         .verify_resume(&ctx, &hash, &proof)
         .await
@@ -276,11 +429,22 @@ async fn evm_wrong_nonce_is_rejected_t18() {
     let account = format!("0x{}", lower_hex(&evm_address(&key)));
     let ctx = ctx_for(&account, "eip155:1");
     let hash = ApprovedTxHash::from_bytes([7u8; 32]);
+    let signed = evm_sighash_fixture();
     seal_grant(&store, &ctx, hash).await;
-    provider.record_session_binding(&ctx.gate_ref, binding_for(&account, "eip155:1"));
+    provider.record_session_binding(
+        &ctx.gate_ref,
+        binding_for(&account, "eip155:1", hash, signed.to_vec()),
+    );
 
     // Proof carries a stale / forged nonce (replay defense).
-    let proof = evm_proof(&key, &account, hash, SESSION_TOPIC, b"other-nonce");
+    let proof = evm_proof(
+        &key,
+        &account,
+        hash,
+        SESSION_TOPIC,
+        b"other-nonce",
+        signed.to_vec(),
+    );
     let err = provider
         .verify_resume(&ctx, &hash, &proof)
         .await
@@ -297,15 +461,60 @@ async fn evm_missing_session_binding_is_rejected() {
     let account = format!("0x{}", lower_hex(&evm_address(&key)));
     let ctx = ctx_for(&account, "eip155:1");
     let hash = ApprovedTxHash::from_bytes([7u8; 32]);
+    let signed = evm_sighash_fixture();
     seal_grant(&store, &ctx, hash).await;
     // No session binding recorded.
 
-    let proof = evm_proof(&key, &account, hash, SESSION_TOPIC, NONCE);
+    let proof = evm_proof(&key, &account, hash, SESSION_TOPIC, NONCE, signed.to_vec());
     let err = provider
         .verify_resume(&ctx, &hash, &proof)
         .await
         .expect_err("missing binding must fail closed");
     assert!(matches!(err, SigningProviderError::ProofInvalid { .. }));
+}
+
+#[tokio::test]
+async fn evm_malformed_response_does_not_burn_binding() {
+    // A malformed relay/wallet response (wrong nonce) must NOT consume the
+    // recorded binding — a subsequent valid proof must still verify (the
+    // "validate first, consume only on success" recommendation).
+    let store = Arc::new(InMemorySealedGrantStore::new());
+    let provider = WalletConnectSigningProvider::new(project(), store.clone());
+
+    let key = evm_key();
+    let account = format!("0x{}", lower_hex(&evm_address(&key)));
+    let ctx = ctx_for(&account, "eip155:1");
+    let hash = ApprovedTxHash::from_bytes([7u8; 32]);
+    let signed = evm_sighash_fixture();
+    seal_grant(&store, &ctx, hash).await;
+    provider.record_session_binding(
+        &ctx.gate_ref,
+        binding_for(&account, "eip155:1", hash, signed.to_vec()),
+    );
+
+    // First: malformed (wrong nonce) — must fail but NOT burn the binding.
+    let bad = evm_proof(
+        &key,
+        &account,
+        hash,
+        SESSION_TOPIC,
+        b"forged-nonce",
+        signed.to_vec(),
+    );
+    assert!(matches!(
+        provider
+            .verify_resume(&ctx, &hash, &bad)
+            .await
+            .expect_err("malformed must fail"),
+        SigningProviderError::ProofInvalid { .. }
+    ));
+
+    // Then: a valid proof against the still-present binding must verify.
+    let good = evm_proof(&key, &account, hash, SESSION_TOPIC, NONCE, signed.to_vec());
+    provider
+        .verify_resume(&ctx, &hash, &good)
+        .await
+        .expect("valid proof after a malformed attempt must still verify");
 }
 
 #[tokio::test]
@@ -317,18 +526,25 @@ async fn evm_replay_after_claim_fails_closed_t20() {
     let account = format!("0x{}", lower_hex(&evm_address(&key)));
     let ctx = ctx_for(&account, "eip155:1");
     let hash = ApprovedTxHash::from_bytes([7u8; 32]);
+    let signed = evm_sighash_fixture();
     seal_grant(&store, &ctx, hash).await;
-    provider.record_session_binding(&ctx.gate_ref, binding_for(&account, "eip155:1"));
+    provider.record_session_binding(
+        &ctx.gate_ref,
+        binding_for(&account, "eip155:1", hash, signed.to_vec()),
+    );
 
-    let proof = evm_proof(&key, &account, hash, SESSION_TOPIC, NONCE);
+    let proof = evm_proof(&key, &account, hash, SESSION_TOPIC, NONCE, signed.to_vec());
     provider
         .verify_resume(&ctx, &hash, &proof)
         .await
         .expect("first resume succeeds");
 
     // Re-record the binding so the replay reaches the grant CAS (the binding is
-    // consumed on first use). The one-shot grant must still reject the replay.
-    provider.record_session_binding(&ctx.gate_ref, binding_for(&account, "eip155:1"));
+    // consumed on first success). The one-shot grant must still reject the replay.
+    provider.record_session_binding(
+        &ctx.gate_ref,
+        binding_for(&account, "eip155:1", hash, signed.to_vec()),
+    );
     let err = provider
         .verify_resume(&ctx, &hash, &proof)
         .await
@@ -345,10 +561,14 @@ async fn evm_unsealed_grant_fails_closed() {
     let account = format!("0x{}", lower_hex(&evm_address(&key)));
     let ctx = ctx_for(&account, "eip155:1");
     let hash = ApprovedTxHash::from_bytes([7u8; 32]);
+    let signed = evm_sighash_fixture();
     // No grant sealed.
-    provider.record_session_binding(&ctx.gate_ref, binding_for(&account, "eip155:1"));
+    provider.record_session_binding(
+        &ctx.gate_ref,
+        binding_for(&account, "eip155:1", hash, signed.to_vec()),
+    );
 
-    let proof = evm_proof(&key, &account, hash, SESSION_TOPIC, NONCE);
+    let proof = evm_proof(&key, &account, hash, SESSION_TOPIC, NONCE, signed.to_vec());
     let err = provider
         .verify_resume(&ctx, &hash, &proof)
         .await
@@ -356,10 +576,68 @@ async fn evm_unsealed_grant_fails_closed() {
     assert!(matches!(err, SigningProviderError::GrantClaimFailed));
 }
 
-// ── verify_resume: Solana (ed25519) ──
+#[tokio::test]
+async fn evm_malformed_unicode_hex_account_fails_closed() {
+    // A bound account carrying a non-ASCII even-byte string used to panic when
+    // the hex parser sliced &str by byte offset (#3). It must now fail closed.
+    let store = Arc::new(InMemorySealedGrantStore::new());
+    let provider = WalletConnectSigningProvider::new(project(), store.clone());
+
+    let key = evm_key();
+    // 40-byte (20 char-pairs) string of a 2-byte multibyte char: ASCII byte
+    // length is even but slicing at odd byte offsets crosses a char boundary.
+    let bad_account = "é".repeat(20); // 40 bytes, all non-ASCII
+    assert_eq!(bad_account.len(), 40);
+    let ctx = ctx_for(&bad_account, "eip155:1");
+    let hash = ApprovedTxHash::from_bytes([7u8; 32]);
+    let signed = evm_sighash_fixture();
+    seal_grant(&store, &ctx, hash).await;
+    provider.record_session_binding(
+        &ctx.gate_ref,
+        binding_for(&bad_account, "eip155:1", hash, signed.to_vec()),
+    );
+
+    let proof = evm_proof(
+        &key,
+        &bad_account,
+        hash,
+        SESSION_TOPIC,
+        NONCE,
+        signed.to_vec(),
+    );
+    let err = provider
+        .verify_resume(&ctx, &hash, &proof)
+        .await
+        .expect_err("malformed unicode hex account must fail closed (not panic)");
+    assert!(matches!(err, SigningProviderError::ProofInvalid { .. }));
+}
 
 #[tokio::test]
-async fn solana_valid_proof_verifies() {
+async fn malformed_unicode_hex_in_proof_field_fails_closed() {
+    // A relay-supplied proof whose hex-encoded fields contain non-ASCII even-byte
+    // content must decode-fail (ProofInvalid), never panic (#3).
+    let store = Arc::new(InMemorySealedGrantStore::new());
+    let provider = WalletConnectSigningProvider::new(project(), store);
+    let ctx = ctx_for("0x00000000000000000000000000000000000000aa", "eip155:1");
+    let hash = ApprovedTxHash::from_bytes([1u8; 32]);
+
+    // Hand-craft JSON with a malformed-unicode hex `signature` field.
+    let json = format!(
+        r#"{{"session_topic":"{SESSION_TOPIC}","approved_tx_hash":{:?},"claimed_signer":"0x00000000000000000000000000000000000000aa","nonce":"6e6f6e6365","signed_payload":"00","signature":"éé"}}"#,
+        hash.as_bytes()
+    );
+    let proof = SigningProof::WalletConnectProof(json.into_bytes());
+    let err = provider
+        .verify_resume(&ctx, &hash, &proof)
+        .await
+        .expect_err("malformed unicode hex in proof must fail closed (not panic)");
+    assert!(matches!(err, SigningProviderError::ProofInvalid { .. }));
+}
+
+// ── verify_resume: Solana (ed25519, real signed message) ──
+
+#[tokio::test]
+async fn solana_valid_proof_over_real_message_verifies() {
     let store = Arc::new(InMemorySealedGrantStore::new());
     let provider: Arc<dyn SigningProvider> =
         Arc::new(WalletConnectSigningProvider::new(project(), store.clone()));
@@ -369,20 +647,24 @@ async fn solana_valid_proof_verifies() {
     let account = lower_hex(&pubkey);
     let ctx = ctx_for(&account, "solana:mainnet");
     let hash = ApprovedTxHash::from_bytes([5u8; 32]);
+    let message = solana_message_fixture();
     seal_grant(&store, &ctx, hash).await;
 
-    // Record binding via the concrete provider, then drive via the dyn handle.
-    // (Downcast not needed: record before boxing in a separate provider value.)
+    // Record binding via a concrete provider, then drive via the dyn handle.
     let inner = WalletConnectSigningProvider::new(project(), store.clone());
-    inner.record_session_binding(&ctx.gate_ref, binding_for(&account, "solana:mainnet"));
+    inner.record_session_binding(
+        &ctx.gate_ref,
+        binding_for(&account, "solana:mainnet", hash, message.clone()),
+    );
 
-    let digest = attestation_digest_for_test(&hash, SESSION_TOPIC, NONCE);
-    let sig = key.sign(&digest);
+    // ed25519 signs the REAL message bytes, as solana_signTransaction would.
+    let sig = key.sign(&message);
     let payload = WalletConnectProofPayload {
         session_topic: SESSION_TOPIC.to_string(),
         approved_tx_hash: hash,
         claimed_signer: account.clone(),
         nonce: NONCE.to_vec(),
+        signed_payload: message,
         signature: sig.to_bytes().to_vec(),
         public_key: Some(pubkey.to_vec()),
     };
@@ -391,7 +673,7 @@ async fn solana_valid_proof_verifies() {
     inner
         .verify_resume(&ctx, &hash, &proof)
         .await
-        .expect("valid solana walletconnect proof must verify");
+        .expect("valid solana walletconnect proof over the real message must verify");
 
     // Object-safety sanity: the dyn handle is usable.
     let _ = provider.provider_id();
@@ -409,16 +691,20 @@ async fn solana_wrong_signer_is_signer_mismatch() {
     let bound_account = lower_hex(&other);
     let ctx = ctx_for(&bound_account, "solana:mainnet");
     let hash = ApprovedTxHash::from_bytes([5u8; 32]);
+    let message = solana_message_fixture();
     seal_grant(&store, &ctx, hash).await;
-    provider.record_session_binding(&ctx.gate_ref, binding_for(&bound_account, "solana:mainnet"));
+    provider.record_session_binding(
+        &ctx.gate_ref,
+        binding_for(&bound_account, "solana:mainnet", hash, message.clone()),
+    );
 
-    let digest = attestation_digest_for_test(&hash, SESSION_TOPIC, NONCE);
-    let sig = key.sign(&digest);
+    let sig = key.sign(&message);
     let payload = WalletConnectProofPayload {
         session_topic: SESSION_TOPIC.to_string(),
         approved_tx_hash: hash,
         claimed_signer: bound_account.clone(),
         nonce: NONCE.to_vec(),
+        signed_payload: message,
         signature: sig.to_bytes().to_vec(),
         public_key: Some(pubkey.to_vec()),
     };
@@ -443,6 +729,34 @@ async fn non_walletconnect_proof_is_rejected() {
         .await
         .expect_err("non-walletconnect proof must be rejected");
     assert!(matches!(err, SigningProviderError::ProofInvalid { .. }));
+}
+
+#[tokio::test]
+async fn near_chain_is_unsupported_fail_closed() {
+    // NEAR is explicitly unsupported on the WC provider until a real verifier
+    // exists — initiate/verify must fail closed at scope resolution.
+    let store = Arc::new(InMemorySealedGrantStore::new());
+    let provider = WalletConnectSigningProvider::new(project(), store);
+    let account = "0011223344556677889900112233445566778899001122334455667788990011";
+    let ctx = ctx_for(account, "near:mainnet");
+    let hash = ApprovedTxHash::from_bytes([1u8; 32]);
+    // A well-formed (decodable) proof so resolution reaches scope pinning, which
+    // is where NEAR is rejected.
+    let payload = WalletConnectProofPayload {
+        session_topic: SESSION_TOPIC.to_string(),
+        approved_tx_hash: hash,
+        claimed_signer: account.to_string(),
+        nonce: NONCE.to_vec(),
+        signed_payload: vec![0u8; 32],
+        signature: vec![0u8; 64],
+        public_key: Some(vec![0u8; 32]),
+    };
+    let proof = SigningProof::WalletConnectProof(encode_walletconnect_proof(&payload));
+    let err = provider
+        .verify_resume(&ctx, &hash, &proof)
+        .await
+        .expect_err("near must fail closed");
+    assert!(matches!(err, SigningProviderError::ScopeViolation { .. }));
 }
 
 #[tokio::test]

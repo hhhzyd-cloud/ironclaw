@@ -1,23 +1,28 @@
-//! Signer recovery / verification for WalletConnect v2 attestations.
+//! Signer recovery / verification for WalletConnect v2 chain signatures.
 //!
-//! A WalletConnect wallet attests to the gate-bound operation by signing a
-//! **domain-separated attestation digest** that commits to *all* of:
+//! A WalletConnect wallet does **not** sign a synthetic attestation digest. It
+//! signs the **real transaction** via `eth_signTransaction` /
+//! `solana_signTransaction`. The proof therefore carries the exact bytes that
+//! chain signature covers ([`WalletConnectProofPayload::signed_payload`](super::proof::WalletConnectProofPayload::signed_payload)):
 //!
-//! * the bound [`ApprovedTxHash`](ironclaw_signing_provider::ApprovedTxHash)
-//!   (WYSIWYS hash binding — replay/tamper defense, T20),
-//! * the WalletConnect **session topic** the proof belongs to (relay/session
-//!   binding — a proof minted under a different session is rejected, T18), and
-//! * a per-request **nonce** (replay defense across requests in the same
-//!   session, T18).
+//! * For EVM the `signed_payload` is the 32-byte secp256k1 sighash (the
+//!   keccak256 of the EIP-2718/RLP signing pre-image); the signer is recovered
+//!   from the 65-byte signature via `k256` ecrecover and reduced to its 20-byte
+//!   address.
+//! * For Solana/NEAR the `signed_payload` is the ed25519 message bytes; the
+//!   signature is verified against the connected ed25519 public key with the
+//!   vendored `ed25519-dalek`.
 //!
-//! For EVM the signer is recovered from the 65-byte signature via secp256k1
-//! ecrecover (`k256`) and reduced to its 20-byte address. For Solana/NEAR the
-//! signer is the connected ed25519 account, verified with the vendored
-//! `ed25519-dalek`. In every case the resolved signer must equal the bound
-//! account ([`SignerMismatch`](ironclaw_signing_provider::SigningProviderError::SignerMismatch)).
+//! In every case the resolved signer must equal the bound account
+//! ([`SignerMismatch`](ironclaw_signing_provider::SigningProviderError::SignerMismatch)).
+//! The binding from `signed_payload` back to the human-approved transaction is
+//! enforced by the caller ([`super::WalletConnectSigningProvider::verify_resume`]),
+//! which requires `signed_payload == binding.expected_signing_payload` (both
+//! derived from the same decoded tx). The session-topic + nonce binding is an
+//! additional anti-replay layer enforced by the caller, not a replacement for
+//! this real chain-signature check.
 //!
-//! This module computes the digest and verifies signatures over it. The relay
-//! transport / Sign envelope crypto comes from the fork — it is never
+//! The relay transport / Sign envelope crypto comes from the fork — it is never
 //! reimplemented here.
 
 use k256::ecdsa::{RecoveryId, Signature as EcSignature, VerifyingKey};
@@ -25,71 +30,57 @@ use sha3::{Digest, Keccak256};
 
 use ed25519_dalek::{Signature as EdSignature, Verifier, VerifyingKey as EdVerifyingKey};
 
-use ironclaw_signing_provider::{ApprovedTxHash, SigningProviderError};
+use ironclaw_signing_provider::SigningProviderError;
 
 use super::namespace::ChainFamily;
 
-/// Domain-separation tag + version byte for the WalletConnect attestation
-/// digest. Distinct from the EIP-191 injected `personal_sign` digest so a proof
-/// minted for one provider can never be replayed against the other.
-const WC_ATTEST_DOMAIN: &[u8] = b"ironclaw/walletconnect/attest/v1";
-
-/// Compute the 32-byte domain-separated attestation digest the wallet signs.
+/// Verify the wallet's **real chain signature** over `signed_payload` and
+/// require the resolved signer to equal `bound_account`.
 ///
-/// `keccak256(domain ∥ approved_tx_hash ∥ len(topic) ∥ topic ∥ len(nonce) ∥ nonce)`.
-/// Length-prefixing the variable-length session topic and nonce makes the
-/// commitment unambiguous (no concatenation collisions between distinct
-/// `(topic, nonce)` pairs).
-pub(super) fn attestation_digest(
-    approved_tx_hash: &ApprovedTxHash,
-    session_topic: &str,
-    nonce: &[u8],
-) -> [u8; 32] {
-    let mut hasher = Keccak256::new();
-    hasher.update(WC_ATTEST_DOMAIN);
-    hasher.update(approved_tx_hash.as_bytes());
-    hasher.update((session_topic.len() as u64).to_be_bytes());
-    hasher.update(session_topic.as_bytes());
-    hasher.update((nonce.len() as u64).to_be_bytes());
-    hasher.update(nonce);
-    let out = hasher.finalize();
-    let mut digest = [0u8; 32];
-    digest.copy_from_slice(&out);
-    digest
-}
-
-/// Verify a WalletConnect attestation signature over `digest` and require the
-/// resolved signer to equal `bound_account`.
-///
-/// * `family` selects the recovery scheme.
+/// * `family` selects the recovery/verification scheme.
+/// * `signed_payload` is the exact bytes the chain signature covers: the
+///   32-byte EVM secp256k1 sighash, or the Solana ed25519 message bytes.
 /// * `signature` is 65 bytes (r ∥ s ∥ v) for EVM, 64 bytes for ed25519 families.
 /// * `public_key` is required (32 bytes) for the ed25519 families and ignored
 ///   for EVM (the address is recovered from the signature).
-pub(super) fn verify_attestation(
+pub(super) fn verify_chain_signature(
     family: ChainFamily,
-    digest: &[u8; 32],
+    signed_payload: &[u8],
     signature: &[u8],
     public_key: Option<&[u8]>,
     bound_account: &str,
 ) -> Result<(), SigningProviderError> {
     match family {
-        ChainFamily::Evm => verify_evm(digest, signature, bound_account),
-        ChainFamily::Solana | ChainFamily::Near => {
+        ChainFamily::Evm => verify_evm(signed_payload, signature, bound_account),
+        ChainFamily::Solana => {
             let pk = public_key.ok_or(SigningProviderError::ProofInvalid {
                 reason: "ed25519 walletconnect proof missing public_key".to_string(),
             })?;
-            verify_ed25519(digest, signature, pk, bound_account)
+            verify_ed25519(signed_payload, signature, pk, bound_account)
         }
     }
 }
 
-/// Recover the EVM signer from a 65-byte signature over `digest` and require it
-/// to equal `bound_account` (`0x`-prefixed, case-insensitive 20-byte hex).
+/// Recover the EVM signer from a 65-byte signature over the 32-byte secp256k1
+/// sighash `signed_payload` and require it to equal `bound_account`
+/// (`0x`-prefixed, case-insensitive 20-byte hex).
 fn verify_evm(
-    digest: &[u8; 32],
+    signed_payload: &[u8],
     signature: &[u8],
     bound_account: &str,
 ) -> Result<(), SigningProviderError> {
+    // The EVM chain signature is over a 32-byte prehash (the EIP-2718/RLP
+    // sighash). Anything else cannot be a valid eth_signTransaction sighash and
+    // fails closed.
+    let prehash: [u8; 32] =
+        signed_payload
+            .try_into()
+            .map_err(|_| SigningProviderError::ProofInvalid {
+                reason: format!(
+                    "evm signed payload must be a 32-byte sighash, got {} bytes",
+                    signed_payload.len()
+                ),
+            })?;
     if signature.len() != 65 {
         return Err(SigningProviderError::ProofInvalid {
             reason: format!("evm signature must be 65 bytes, got {}", signature.len()),
@@ -102,7 +93,7 @@ fn verify_evm(
     })?;
     let rec_id = recovery_id_from_v(signature[64])?;
     let recovered =
-        VerifyingKey::recover_from_prehash(digest.as_slice(), &sig, rec_id).map_err(|e| {
+        VerifyingKey::recover_from_prehash(prehash.as_slice(), &sig, rec_id).map_err(|e| {
             SigningProviderError::ProofInvalid {
                 reason: format!("evm signer recovery failed: {e}"),
             }
@@ -115,10 +106,11 @@ fn verify_evm(
     Ok(())
 }
 
-/// Verify a 64-byte ed25519 signature over `digest` against `public_key`, and
-/// require `public_key` to equal `bound_account` (lowercase 32-byte hex).
+/// Verify a 64-byte ed25519 signature over the message `signed_payload` against
+/// `public_key`, and require `public_key` to equal `bound_account` (lowercase
+/// 32-byte hex).
 fn verify_ed25519(
-    digest: &[u8; 32],
+    signed_payload: &[u8],
     signature: &[u8],
     public_key: &[u8],
     bound_account: &str,
@@ -158,7 +150,7 @@ fn verify_ed25519(
             })?;
     let sig = EdSignature::from_bytes(&sig_bytes);
     verifying_key
-        .verify(digest, &sig)
+        .verify(signed_payload, &sig)
         .map_err(|e| SigningProviderError::ProofInvalid {
             reason: format!("ed25519 verification failed: {e}"),
         })?;
@@ -194,38 +186,47 @@ fn address_from_verifying_key(key: &VerifyingKey) -> [u8; 20] {
 
 /// Parse a `0x`-prefixed (case-insensitive) hex EVM address into 20 bytes.
 fn parse_evm_address(s: &str) -> Result<[u8; 20], SigningProviderError> {
-    let stripped = s.strip_prefix("0x").unwrap_or(s);
-    if stripped.len() != 40 {
-        return Err(SigningProviderError::ProofInvalid {
-            reason: format!("bound account is not a 20-byte evm address: {s}"),
-        });
-    }
-    let mut out = [0u8; 20];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&stripped[i * 2..i * 2 + 2], 16).map_err(|e| {
-            SigningProviderError::ProofInvalid {
-                reason: format!("bound account hex invalid: {e}"),
-            }
-        })?;
-    }
-    Ok(out)
+    decode_hex_fixed::<20>(s).map_err(|_| SigningProviderError::ProofInvalid {
+        reason: format!("bound account is not a 20-byte evm address: {s}"),
+    })
 }
 
 /// Parse a lowercase-hex 32-byte ed25519 public key into bytes.
 fn parse_ed25519_pubkey(s: &str) -> Result<[u8; 32], SigningProviderError> {
+    decode_hex_fixed::<32>(s).map_err(|_| SigningProviderError::ProofInvalid {
+        reason: format!("bound account is not a 32-byte ed25519 key: {s}"),
+    })
+}
+
+/// Decode `0x`-prefixed (case-insensitive) hex into a fixed-size `[u8; N]`,
+/// panic-free on any input.
+///
+/// Operates on **bytes**, never on `&str` byte-offset slices: a non-ASCII
+/// even-byte input (e.g. a 2-byte multibyte char) would make byte-offset
+/// slicing land on an invalid UTF-8 boundary and panic. Rejecting non-ASCII /
+/// non-hex up front keeps relay/wallet-supplied input fail-closed (#3).
+fn decode_hex_fixed<const N: usize>(s: &str) -> Result<[u8; N], ()> {
     let stripped = s.strip_prefix("0x").unwrap_or(s);
-    if stripped.len() != 64 {
-        return Err(SigningProviderError::ProofInvalid {
-            reason: format!("bound account is not a 32-byte ed25519 key: {s}"),
-        });
+    let bytes = stripped.as_bytes();
+    if bytes.len() != N * 2 {
+        return Err(());
     }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&stripped[i * 2..i * 2 + 2], 16).map_err(|e| {
-            SigningProviderError::ProofInvalid {
-                reason: format!("bound account hex invalid: {e}"),
-            }
-        })?;
+    let mut out = [0u8; N];
+    for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out[i] = (hi << 4) | lo;
     }
     Ok(out)
+}
+
+/// Map a single ASCII hex digit byte to its nibble value, or `Err` for any
+/// non-hex / non-ASCII byte.
+fn hex_nibble(b: u8) -> Result<u8, ()> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(()),
+    }
 }

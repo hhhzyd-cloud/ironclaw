@@ -4,6 +4,16 @@
 //! byte body. The payload echoes everything the verifier re-checks against the
 //! recorded [`SessionBinding`](super::session::SessionBinding) and the bound
 //! account — none of it is trusted on its own.
+//!
+//! The security-critical field is [`WalletConnectProofPayload::signed_payload`]:
+//! the **exact bytes the wallet's chain signature covers** (the EVM secp256k1
+//! sighash / the Solana ed25519 message), as returned by
+//! `eth_signTransaction` / `solana_signTransaction`. The verifier checks the
+//! real chain signature over *those* bytes and requires them to equal the
+//! `expected_signing_payload` recorded at `initiate` from the same decoded
+//! transaction that produced the approved hash — see
+//! [`super::WalletConnectSigningProvider::verify_resume`]. A signature over a
+//! synthetic digest is never accepted.
 
 use serde::{Deserialize, Serialize};
 
@@ -29,8 +39,18 @@ pub struct WalletConnectProofPayload {
     /// binding nonce (T18).
     #[serde(with = "hex_bytes")]
     pub nonce: Vec<u8>,
-    /// The signature over the domain-separated attestation digest. 65 bytes
-    /// (r ∥ s ∥ v) for EVM, 64 bytes for ed25519 families.
+    /// The **exact bytes the wallet's chain signature covers** — the EVM
+    /// secp256k1 sighash / the Solana ed25519 message returned by
+    /// `eth_signTransaction` / `solana_signTransaction`. The verifier checks the
+    /// chain signature over *these* bytes and requires them to equal the
+    /// `expected_signing_payload` recorded at `initiate` from the same decoded
+    /// transaction that produced the approved hash (the binding back to what the
+    /// human approved). Never trusted on its own — a payload that does not match
+    /// the recorded expectation is rejected before any signature work (#1).
+    #[serde(with = "hex_bytes")]
+    pub signed_payload: Vec<u8>,
+    /// The chain signature over [`Self::signed_payload`]. 65 bytes (r ∥ s ∥ v)
+    /// for EVM secp256k1, 64 bytes for ed25519 families.
     #[serde(with = "hex_bytes")]
     pub signature: Vec<u8>,
     /// For the ed25519 families (Solana / NEAR), the 32-byte public key the
