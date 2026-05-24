@@ -53,8 +53,15 @@ pub struct JsonRpcEvmBroadcaster {
 
 #[cfg(feature = "broadcast-http")]
 impl JsonRpcEvmBroadcaster {
-    /// Build a broadcaster against `rpc_url`. The HTTP client is rustls-backed.
-    pub fn new(rpc_url: impl Into<String>) -> Result<Self, ChainSigningError> {
+    /// Build a broadcaster against a raw URL string, validating it through
+    /// [`crate::RpcEndpoint`] (rejects metadata/loopback/private/link-local
+    /// hosts and non-http schemes). The HTTP client is rustls-backed.
+    pub fn new(rpc_url: impl AsRef<str>) -> Result<Self, ChainSigningError> {
+        Self::with_endpoint(crate::RpcEndpoint::parse(rpc_url)?)
+    }
+
+    /// Build against a pre-validated [`crate::RpcEndpoint`].
+    pub fn with_endpoint(endpoint: crate::RpcEndpoint) -> Result<Self, ChainSigningError> {
         let client =
             reqwest::Client::builder()
                 .build()
@@ -64,16 +71,16 @@ impl JsonRpcEvmBroadcaster {
                 })?;
         Ok(Self {
             client,
-            rpc_url: rpc_url.into(),
+            rpc_url: endpoint.as_str().to_string(),
         })
     }
 
-    /// Build over a pre-configured client (so callers can inject timeouts /
-    /// proxy / allowlist policy).
-    pub fn with_client(client: reqwest::Client, rpc_url: impl Into<String>) -> Self {
+    /// Build over a pre-configured client and pre-validated endpoint (so callers
+    /// can inject timeouts / proxy / allowlist policy).
+    pub fn with_client(client: reqwest::Client, endpoint: crate::RpcEndpoint) -> Self {
         Self {
             client,
-            rpc_url: rpc_url.into(),
+            rpc_url: endpoint.as_str().to_string(),
         }
     }
 }
@@ -89,7 +96,7 @@ impl EvmBroadcaster for JsonRpcEvmBroadcaster {
         let raw_hex = format!("0x{}", crate::broadcast_http::hex_encode(signed_rlp));
         let request = serde_json::json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": crate::broadcast_http::RPC_REQUEST_ID,
             "method": "eth_sendRawTransaction",
             "params": [raw_hex],
         });
@@ -100,17 +107,10 @@ impl EvmBroadcaster for JsonRpcEvmBroadcaster {
             .send()
             .await
             .map_err(|error| broadcast(format!("request failed: {error}")))?;
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|error| broadcast(format!("invalid JSON-RPC response: {error}")))?;
-        if let Some(error) = body.get("error") {
-            return Err(broadcast(format!("node rejected transaction: {error}")));
-        }
-        let result = body
-            .get("result")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| broadcast("JSON-RPC response missing result".to_string()))?;
+        let result = crate::broadcast_http::read_jsonrpc_result("evm", response).await?;
+        let result = result
+            .as_str()
+            .ok_or_else(|| broadcast("JSON-RPC result was not a string tx hash".to_string()))?;
         let bytes = crate::broadcast_http::decode_hex(result.trim_start_matches("0x"))
             .map_err(|reason| broadcast(format!("invalid tx hash in response: {reason}")))?;
         let tx_hash: [u8; 32] = bytes

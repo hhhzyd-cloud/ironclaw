@@ -11,8 +11,12 @@
 //! * write-through on every [`AttestedGateBindingStore::put`].
 //!
 //! The DB row is the source of truth; the cache is the sync read path. Bindings
-//! are stored as a single JSON column and rows are never deleted (a re-`put`
-//! upserts, matching the in-memory last-write-wins semantics).
+//! are stored as a single JSON column and rows are never deleted. A binding is
+//! **immutable once written**: the upsert is insert-only per `gate_ref`
+//! (`ON CONFLICT DO NOTHING`), so a re-`put` after approval is rejected at the
+//! DB level rather than silently changing the binding the resume path verifies
+//! against. (If versioned overwrite is ever needed it must carry explicit
+//! version/audit metadata; the default is reject.)
 
 #[cfg(any(feature = "postgres", feature = "libsql"))]
 use std::collections::HashMap;
@@ -134,23 +138,41 @@ mod postgres {
                     return;
                 }
             };
-            if let Ok(client) = self.client().await {
-                if let Err(error) = client
-                    .execute(
-                        "INSERT INTO attested_gate_bindings (gate_ref, binding_json) \
-                         VALUES ($1, $2) \
-                         ON CONFLICT (gate_ref) DO UPDATE SET binding_json = EXCLUDED.binding_json",
-                        &[&gate_ref.as_str(), &json],
-                    )
-                    .await
-                {
+            let client = match self.client().await {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::error!(%error, "failed to acquire connection for binding put");
+                    return;
+                }
+            };
+            // Insert-only per gate_ref: a binding is immutable once written. A
+            // conflicting write (a re-put after approval) is REJECTED, not
+            // silently applied — the approved binding must never change under
+            // the resume path. `DO NOTHING` + the affected-row count is the
+            // DB-level guard (no SELECT-then-INSERT race).
+            let inserted = match client
+                .execute(
+                    "INSERT INTO attested_gate_bindings (gate_ref, binding_json) \
+                     VALUES ($1, $2) \
+                     ON CONFLICT (gate_ref) DO NOTHING",
+                    &[&gate_ref.as_str(), &json],
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) => {
                     tracing::error!(%error, "failed to persist attested gate binding");
                     return;
                 }
-            } else {
+            };
+            if inserted == 0 {
+                tracing::error!(
+                    gate_ref = %gate_ref.as_str(),
+                    "rejected attempt to overwrite an existing immutable gate binding"
+                );
                 return;
             }
-            // Write-through only after the durable write succeeds.
+            // Write-through only after the durable insert succeeds.
             self.cache.insert(gate_ref, binding);
         }
 
@@ -249,16 +271,30 @@ mod libsql_backend {
                     return;
                 }
             };
-            if let Err(error) = conn
+            // Insert-only per gate_ref: a binding is immutable once written. A
+            // conflicting re-put is REJECTED at the DB level (`DO NOTHING` +
+            // affected-row count), never silently overwriting the approved
+            // binding under the resume path.
+            let inserted = match conn
                 .execute(
                     "INSERT INTO attested_gate_bindings (gate_ref, binding_json) \
                      VALUES (?1, ?2) \
-                     ON CONFLICT (gate_ref) DO UPDATE SET binding_json = excluded.binding_json",
+                     ON CONFLICT (gate_ref) DO NOTHING",
                     libsql::params![gate_ref.as_str(), json],
                 )
                 .await
             {
-                tracing::error!(%error, "failed to persist attested gate binding");
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::error!(%error, "failed to persist attested gate binding");
+                    return;
+                }
+            };
+            if inserted == 0 {
+                tracing::error!(
+                    gate_ref = %gate_ref.as_str(),
+                    "rejected attempt to overwrite an existing immutable gate binding"
+                );
                 return;
             }
             self.cache.insert(gate_ref, binding);

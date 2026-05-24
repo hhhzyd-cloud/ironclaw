@@ -48,8 +48,14 @@ pub struct JsonRpcNearBroadcaster {
 
 #[cfg(feature = "broadcast-http")]
 impl JsonRpcNearBroadcaster {
-    /// Build a broadcaster against `rpc_url` (rustls-backed HTTP client).
-    pub fn new(rpc_url: impl Into<String>) -> Result<Self, ChainSigningError> {
+    /// Build a broadcaster against a raw URL string, validated through
+    /// [`crate::RpcEndpoint`] (rustls-backed HTTP client).
+    pub fn new(rpc_url: impl AsRef<str>) -> Result<Self, ChainSigningError> {
+        Self::with_endpoint(crate::RpcEndpoint::parse(rpc_url)?)
+    }
+
+    /// Build against a pre-validated [`crate::RpcEndpoint`].
+    pub fn with_endpoint(endpoint: crate::RpcEndpoint) -> Result<Self, ChainSigningError> {
         let client =
             reqwest::Client::builder()
                 .build()
@@ -59,15 +65,16 @@ impl JsonRpcNearBroadcaster {
                 })?;
         Ok(Self {
             client,
-            rpc_url: rpc_url.into(),
+            rpc_url: endpoint.as_str().to_string(),
         })
     }
 
-    /// Build over a pre-configured client (injected timeouts / proxy / policy).
-    pub fn with_client(client: reqwest::Client, rpc_url: impl Into<String>) -> Self {
+    /// Build over a pre-configured client and pre-validated endpoint (injected
+    /// timeouts / proxy / policy).
+    pub fn with_client(client: reqwest::Client, endpoint: crate::RpcEndpoint) -> Self {
         Self {
             client,
-            rpc_url: rpc_url.into(),
+            rpc_url: endpoint.as_str().to_string(),
         }
     }
 }
@@ -88,7 +95,7 @@ impl NearBroadcaster for JsonRpcNearBroadcaster {
         let encoded = base64::engine::general_purpose::STANDARD.encode(signed_tx);
         let request = serde_json::json!({
             "jsonrpc": "2.0",
-            "id": "ironclaw",
+            "id": crate::broadcast_http::RPC_REQUEST_ID,
             "method": "broadcast_tx_async",
             "params": [encoded],
         });
@@ -99,19 +106,14 @@ impl NearBroadcaster for JsonRpcNearBroadcaster {
             .send()
             .await
             .map_err(|error| broadcast(format!("request failed: {error}")))?;
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|error| broadcast(format!("invalid JSON-RPC response: {error}")))?;
-        if let Some(error) = body.get("error") {
-            return Err(broadcast(format!("node rejected transaction: {error}")));
-        }
+        let result = crate::broadcast_http::read_jsonrpc_result("near", response).await?;
         // `broadcast_tx_async` returns the tx hash directly as the result string.
-        let tx_hash = body
-            .get("result")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| broadcast("JSON-RPC response missing result".to_string()))?
-            .to_string();
+        // Validate its SHAPE (base58 decoding to 32 bytes) — a hostile node must
+        // not be able to return an arbitrary string we'd accept as a tx hash.
+        let result = result
+            .as_str()
+            .ok_or_else(|| broadcast("JSON-RPC result was not a string tx hash".to_string()))?;
+        let tx_hash = crate::broadcast_http::validate_near_tx_hash("near", result)?;
         Ok(NearBroadcastOutcome { tx_hash })
     }
 }

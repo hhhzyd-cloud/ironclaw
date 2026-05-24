@@ -97,6 +97,63 @@ async fn put_then_async_and_sync_read_agree() {
 }
 
 #[tokio::test]
+async fn binding_is_immutable_after_first_put() {
+    // A binding must never change after approval: a second put for the same
+    // gate_ref is rejected at the DB level, and both the async and sync read
+    // paths keep returning the ORIGINAL binding.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("bindings.db");
+    let store = build(&path).await;
+    let gate = GateRef::new(GATE);
+
+    let original = sample_binding();
+    store.put(gate.clone(), original.clone()).await;
+    let original_hash = original.approved_tx_hash;
+
+    // Build a DIFFERENT binding (different approved tx -> different hash) and
+    // attempt to overwrite the same gate_ref.
+    let mut tampered = sample_binding();
+    let tx = TxEip1559 {
+        chain_id: 11155111,
+        nonce: 99,
+        gas_limit: 21_000,
+        max_fee_per_gas: 30_000_000_000,
+        max_priority_fee_per_gas: 1_000_000_000,
+        to: TxKind::Call(Address::repeat_byte(0x22)),
+        value: U256::from(999u64),
+        input: Bytes::new(),
+        access_list: Default::default(),
+    };
+    let decoded: DecodedTransaction = evm::decode_eip1559(&tx);
+    tampered.approved_tx_hash =
+        ironclaw_chain_signing::recompute_approved_hash(&decoded, RenderingSchemaVersion::CURRENT);
+    tampered.decoded = decoded;
+    assert_ne!(
+        tampered.approved_tx_hash, original_hash,
+        "test setup: tampered binding must differ"
+    );
+
+    store.put(gate.clone(), tampered).await;
+
+    // The overwrite was rejected: original binding still stands on both paths.
+    let via_async = store.get(&gate).await.expect("async read");
+    let via_sync = store.get_sync(&gate).expect("sync read");
+    assert_eq!(via_async.approved_tx_hash, original_hash);
+    assert_eq!(via_sync.approved_tx_hash, original_hash);
+
+    // And it survives a reopen (the durable row was never updated).
+    drop(store);
+    let reopened = build(&path).await;
+    assert_eq!(
+        reopened
+            .get_sync(&gate)
+            .expect("rehydrated")
+            .approved_tx_hash,
+        original_hash
+    );
+}
+
+#[tokio::test]
 async fn binding_survives_store_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("bindings.db");

@@ -62,6 +62,8 @@ pub mod evm;
 pub mod near;
 pub mod solana;
 
+#[cfg(feature = "broadcast-http")]
+pub use broadcast_http::RpcEndpoint;
 pub use chain::{ChainFamily, ChainKeyId};
 pub use custodial::{
     CustodialSignOutcome, CustodialSignRequest, CustodialSigner, recompute_approved_hash,

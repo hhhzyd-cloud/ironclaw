@@ -45,8 +45,14 @@ pub struct JsonRpcSolanaBroadcaster {
 
 #[cfg(feature = "broadcast-http")]
 impl JsonRpcSolanaBroadcaster {
-    /// Build a broadcaster against `rpc_url` (rustls-backed HTTP client).
-    pub fn new(rpc_url: impl Into<String>) -> Result<Self, ChainSigningError> {
+    /// Build a broadcaster against a raw URL string, validated through
+    /// [`crate::RpcEndpoint`] (rustls-backed HTTP client).
+    pub fn new(rpc_url: impl AsRef<str>) -> Result<Self, ChainSigningError> {
+        Self::with_endpoint(crate::RpcEndpoint::parse(rpc_url)?)
+    }
+
+    /// Build against a pre-validated [`crate::RpcEndpoint`].
+    pub fn with_endpoint(endpoint: crate::RpcEndpoint) -> Result<Self, ChainSigningError> {
         let client =
             reqwest::Client::builder()
                 .build()
@@ -56,15 +62,16 @@ impl JsonRpcSolanaBroadcaster {
                 })?;
         Ok(Self {
             client,
-            rpc_url: rpc_url.into(),
+            rpc_url: endpoint.as_str().to_string(),
         })
     }
 
-    /// Build over a pre-configured client (injected timeouts / proxy / policy).
-    pub fn with_client(client: reqwest::Client, rpc_url: impl Into<String>) -> Self {
+    /// Build over a pre-configured client and pre-validated endpoint (injected
+    /// timeouts / proxy / policy).
+    pub fn with_client(client: reqwest::Client, endpoint: crate::RpcEndpoint) -> Self {
         Self {
             client,
-            rpc_url: rpc_url.into(),
+            rpc_url: endpoint.as_str().to_string(),
         }
     }
 }
@@ -85,7 +92,7 @@ impl SolanaBroadcaster for JsonRpcSolanaBroadcaster {
         let encoded = base64::engine::general_purpose::STANDARD.encode(signed_tx);
         let request = serde_json::json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": crate::broadcast_http::RPC_REQUEST_ID,
             "method": "sendTransaction",
             // skipPreflight=false keeps the node's sanity checks; encoding must
             // match the payload. We never set a `maxRetries` that would let the
@@ -99,17 +106,10 @@ impl SolanaBroadcaster for JsonRpcSolanaBroadcaster {
             .send()
             .await
             .map_err(|error| broadcast(format!("request failed: {error}")))?;
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|error| broadcast(format!("invalid JSON-RPC response: {error}")))?;
-        if let Some(error) = body.get("error") {
-            return Err(broadcast(format!("node rejected transaction: {error}")));
-        }
-        let signature_b58 = body
-            .get("result")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| broadcast("JSON-RPC response missing result".to_string()))?;
+        let result = crate::broadcast_http::read_jsonrpc_result("solana", response).await?;
+        let signature_b58 = result
+            .as_str()
+            .ok_or_else(|| broadcast("JSON-RPC result was not a string signature".to_string()))?;
         let bytes = bs58::decode(signature_b58)
             .into_vec()
             .map_err(|error| broadcast(format!("invalid base58 signature: {error}")))?;

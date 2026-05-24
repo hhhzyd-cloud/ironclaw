@@ -7,6 +7,64 @@
 
 use ironclaw_attestation::ledger::contract;
 
+/// Concurrent-CAS proof for the durable `UPDATE ... WHERE state = <from>`.
+///
+/// The sequential `broadcast_idempotency_guard` case proves the transition
+/// rules, but not that the DB-level conditional UPDATE actually serializes
+/// concurrent advances. This drives many tasks racing to advance the SAME row
+/// `Signed -> BroadcastSubmitted` (the exact transition a `Stuck -> InProgress`
+/// recovery double-fire would attempt) and asserts EXACTLY ONE wins — so a
+/// second broadcast with fresh chain metadata can never be produced under
+/// contention. Defined here (not in `ironclaw_attestation`) because the durable
+/// backends are the only impls whose atomicity is in question; the in-memory
+/// reference is single-mutex by construction.
+mod concurrent {
+    use std::sync::Arc;
+
+    use ironclaw_attestation::{LedgerError, SigningLedger, SigningLedgerState};
+    use ironclaw_signing_provider::GateRef;
+
+    pub async fn advance_to_broadcast_yields_one_winner<L>(ledger: L)
+    where
+        L: SigningLedger + Send + Sync + 'static,
+    {
+        use SigningLedgerState::*;
+        let ledger = Arc::new(ledger);
+        let gate = GateRef::new("gate:ledger-concurrent");
+
+        // Drive the row up to `Signed` sequentially.
+        ledger.create(&gate).await.expect("create");
+        ledger.advance(&gate, Signing).await.expect("signing");
+        ledger.advance(&gate, Signed).await.expect("signed");
+
+        // Now race 32 tasks all attempting Signed -> BroadcastSubmitted.
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let ledger = Arc::clone(&ledger);
+            let gate = gate.clone();
+            handles.push(tokio::spawn(async move {
+                ledger.advance(&gate, BroadcastSubmitted).await
+            }));
+        }
+
+        let mut ok = 0usize;
+        let mut invalid = 0usize;
+        for handle in handles {
+            match handle.await.expect("task join") {
+                Ok(()) => ok += 1,
+                Err(LedgerError::InvalidTransition { .. }) => invalid += 1,
+                Err(other) => panic!("unexpected error under contention: {other:?}"),
+            }
+        }
+        assert_eq!(ok, 1, "exactly one advance must win the CAS");
+        assert_eq!(invalid, 31, "all losers must see InvalidTransition");
+        assert_eq!(
+            ledger.state(&gate).await.expect("state"),
+            BroadcastSubmitted
+        );
+    }
+}
+
 #[cfg(feature = "libsql")]
 mod libsql_backend {
     use super::*;
@@ -56,6 +114,10 @@ mod libsql_backend {
     #[tokio::test]
     async fn terminal_states_never_advance() {
         contract::terminal_states_never_advance(fresh().await).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_advance_to_broadcast_yields_one_winner() {
+        super::concurrent::advance_to_broadcast_yields_one_winner(fresh().await).await;
     }
 }
 
@@ -109,4 +171,16 @@ mod postgres_backend {
     pg_case!(regression_is_invalid);
     pg_case!(broadcast_idempotency_guard);
     pg_case!(terminal_states_never_advance);
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_advance_to_broadcast_yields_one_winner() {
+        let Some(ledger) = fresh().await else {
+            eprintln!(
+                "ATTESTED_STORE_TEST_PG_URL unset; skipping \
+                 concurrent_advance_to_broadcast_yields_one_winner"
+            );
+            return;
+        };
+        super::concurrent::advance_to_broadcast_yields_one_winner(ledger).await;
+    }
 }
