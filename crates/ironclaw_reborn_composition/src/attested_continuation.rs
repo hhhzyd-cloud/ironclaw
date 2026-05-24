@@ -26,7 +26,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use ironclaw_attested_runtime::ContinuationError;
+use ironclaw_attested_runtime::{
+    AttestedGateBindingStore, ContinuationError, InMemoryAttestedGateBindingStore,
+};
 use ironclaw_product_workflow::{
     AttestedContinuationOutcome, AttestedContinuationRejection, AttestedGateContinuationPort,
     AttestedProofClaim, AttestedProofKind,
@@ -57,6 +59,10 @@ type NoEvmTx = alloy_consensus::TxEip1559;
 /// runtime (the same driver + binding store + ledger the resume port reads).
 pub struct RebornAttestedContinuation {
     driver: Arc<LocalDevContinuationDriver>,
+    /// The authoritative gate-binding store, shared with the driver and the
+    /// resume port. Read (never mutated) by [`Self::verify_resolution`] to
+    /// re-check the proof against the bound hash before `resume_turn`.
+    bindings: Arc<InMemoryAttestedGateBindingStore>,
 }
 
 impl RebornAttestedContinuation {
@@ -64,12 +70,48 @@ impl RebornAttestedContinuation {
     pub fn new(composition: &RebornAttestedComposition) -> Self {
         Self {
             driver: Arc::clone(composition.driver()),
+            bindings: Arc::clone(composition.bindings()),
         }
     }
 }
 
 #[async_trait]
 impl AttestedGateContinuationPort for RebornAttestedContinuation {
+    async fn verify_resolution(
+        &self,
+        _scope: &TurnScope,
+        _run_id: TurnRunId,
+        gate_ref: &GateRef,
+        claim: &AttestedProofClaim,
+    ) -> Result<(), AttestedContinuationRejection> {
+        // Read-only preflight: decode the proof and re-check it against the
+        // authoritative binding persisted at gate-raise. No grant claim, no
+        // ledger advance — a failure here must leave NO state mutated so the
+        // facade can safely refuse the resume.
+        let proof = decode_proof(claim)?;
+        let signing_gate_ref = SigningGateRef::new(gate_ref.as_str());
+        let binding = self
+            .bindings
+            .get(&signing_gate_ref)
+            .await
+            .ok_or(AttestedContinuationRejection::MissingBinding)?;
+
+        // The attested hash must equal the authoritative bound hash (threat #3):
+        // a caller can only attest to the bound hash, never redefine it. The
+        // cryptographic signature/grant check still runs post-resume in the
+        // driver (see the trait doc / coordination note). `decode_proof` above
+        // already validated the proof_json structure (incl. its own embedded
+        // hash); `claim.approved_tx_hash_hex` is the on-the-wire attested hash
+        // (it becomes the resume `AttestationClaimRef`), so binding it here
+        // closes the fail-open window without mutating any state.
+        let _ = &proof;
+        let attested_hash = parse_hash(&claim.approved_tx_hash_hex)?;
+        if attested_hash.as_bytes() != binding.approved_tx_hash.as_bytes() {
+            return Err(AttestedContinuationRejection::ProofRejected);
+        }
+        Ok(())
+    }
+
     async fn continue_resolved_gate(
         &self,
         _scope: &TurnScope,
@@ -177,18 +219,35 @@ fn parse_hash(s: &str) -> Result<ApprovedTxHash, AttestedContinuationRejection> 
 }
 
 /// Decode a hex string (optionally `0x`-prefixed) to bytes.
+///
+/// Operates over raw bytes after validating the input is pure ASCII-hex, so a
+/// multibyte-Unicode JSON value can never trigger a non-char-boundary slice
+/// panic — a malformed (non-ASCII-hex or odd-length) input fails closed as
+/// [`AttestedContinuationRejection::MalformedProof`].
 fn parse_hex(s: &str) -> Result<Vec<u8>, AttestedContinuationRejection> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    if !s.len().is_multiple_of(2) {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return Err(AttestedContinuationRejection::MalformedProof);
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&s[i..i + 2], 16)
-                .map_err(|_| AttestedContinuationRejection::MalformedProof)
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let hi = hex_nibble(pair[0])?;
+            let lo = hex_nibble(pair[1])?;
+            Ok((hi << 4) | lo)
         })
         .collect()
+}
+
+/// Decode a single ASCII-hex digit to its nibble value, fail-closed.
+fn hex_nibble(byte: u8) -> Result<u8, AttestedContinuationRejection> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(AttestedContinuationRejection::MalformedProof),
+    }
 }
 
 /// Wire input for an injected-wallet proof (lowercase-hex fields). Mirrors the
@@ -260,5 +319,52 @@ fn map_continuation_error(error: ContinuationError) -> AttestedContinuationRejec
         ContinuationError::ChainSigning(_) | ContinuationError::Broadcast { .. } => {
             AttestedContinuationRejection::ProofRejected
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_rejects_multibyte_unicode_without_panicking() {
+        // A multibyte-Unicode string whose byte length is even: the old
+        // byte-offset `&s[i..i+2]` slice would panic on a non-char-boundary.
+        // It must fail closed as MalformedProof instead.
+        let result = parse_hex("déadbeef");
+        assert!(matches!(
+            result,
+            Err(AttestedContinuationRejection::MalformedProof)
+        ));
+
+        // Other Unicode shapes (odd byte length, emoji) must also fail closed.
+        assert!(matches!(
+            parse_hex("é"),
+            Err(AttestedContinuationRejection::MalformedProof)
+        ));
+        assert!(matches!(
+            parse_hex("🦀🦀"),
+            Err(AttestedContinuationRejection::MalformedProof)
+        ));
+    }
+
+    #[test]
+    fn parse_hex_accepts_valid_hex_with_optional_prefix() {
+        assert_eq!(parse_hex("00ff").unwrap(), vec![0x00, 0xff]);
+        assert_eq!(parse_hex("0xDEAD").unwrap(), vec![0xde, 0xad]);
+        assert_eq!(parse_hex("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn parse_hash_rejects_unicode_and_wrong_length() {
+        assert!(matches!(
+            parse_hash("déadbeef"),
+            Err(AttestedContinuationRejection::MalformedProof)
+        ));
+        // Valid hex but not 32 bytes.
+        assert!(matches!(
+            parse_hash("00ff"),
+            Err(AttestedContinuationRejection::MalformedProof)
+        ));
     }
 }

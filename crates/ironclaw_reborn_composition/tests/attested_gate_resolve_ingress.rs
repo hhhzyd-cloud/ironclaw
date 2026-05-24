@@ -33,9 +33,13 @@ use ironclaw_host_api::{
     AgentId, InvocationId, ProjectId, ResourceScope, TenantId, ThreadId, UserId,
 };
 use ironclaw_product_workflow::{
-    RebornServices, RebornServicesApi, WebUiAuthenticatedCaller, WebUiResolveGateRequest,
+    AttestedContinuationOutcome, AttestedContinuationRejection, AttestedGateContinuationPort,
+    AttestedProofClaim, RebornServices, RebornServicesApi, WebUiAuthenticatedCaller,
+    WebUiResolveGateRequest,
 };
-use ironclaw_reborn_composition::{RebornAttestedComposition, RebornAttestedContinuation};
+use ironclaw_reborn_composition::{
+    RebornAttestedComposition, RebornAttestedContinuation, RegisterAttestedGateError,
+};
 use ironclaw_secrets::SecretsCrypto;
 use ironclaw_signing_provider::{
     ActorId, ApprovedTxHash, ChainId, GateRef as SigningGateRef, KeyOrAccountId, ProviderId, RunId,
@@ -383,5 +387,245 @@ async fn resolve_gate_attested_without_continuation_port_fails_closed() {
     assert!(
         result.is_err(),
         "attested resolve with no continuation port wired must fail closed"
+    );
+}
+
+/// A continuation port wrapper that counts how many times the continuation
+/// (`continue_resolved_gate`) is actually driven, and how many times the
+/// preflight (`verify_resolution`) runs, delegating both to the real composition
+/// port. Lets the tests assert the verify-before-resume ordering and the
+/// drive-exactly-once invariant.
+struct CountingContinuation {
+    inner: RebornAttestedContinuation,
+    verify_calls: Arc<std::sync::atomic::AtomicUsize>,
+    drive_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl AttestedGateContinuationPort for CountingContinuation {
+    async fn verify_resolution(
+        &self,
+        scope: &TurnScope,
+        run_id: TurnRunId,
+        gate_ref: &GateRef,
+        claim: &AttestedProofClaim,
+    ) -> Result<(), AttestedContinuationRejection> {
+        self.verify_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner
+            .verify_resolution(scope, run_id, gate_ref, claim)
+            .await
+    }
+
+    async fn continue_resolved_gate(
+        &self,
+        scope: &TurnScope,
+        run_id: TurnRunId,
+        gate_ref: &GateRef,
+        claim: &AttestedProofClaim,
+    ) -> Result<AttestedContinuationOutcome, AttestedContinuationRejection> {
+        self.drive_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner
+            .continue_resolved_gate(scope, run_id, gate_ref, claim)
+            .await
+    }
+}
+
+/// Build a fully-wired services + turn store + composition over a shared binding
+/// store, with a `CountingContinuation` so a test can observe drive/verify counts.
+async fn wired_services_with_counting(
+    bytes_seed: u8,
+) -> (
+    RebornServices,
+    Arc<InMemoryTurnStateStore>,
+    String,
+    EdSigningKey,
+    ApprovedTxHash,
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let hash = bound_hash();
+    let hash_ref = approved_tx_hash_ref_hex(hash.as_bytes());
+    let key = EdSigningKey::from_bytes(&[bytes_seed; 32]);
+    let account_hex = lower_hex(&key.verifying_key().to_bytes());
+
+    let bindings = Arc::new(InMemoryAttestedGateBindingStore::new());
+    let resume_guard: Arc<dyn ResumeGuard> = Arc::new(InMemoryResumeGuard::new());
+    let port: Arc<dyn AttestedResumePort> = Arc::new(RuntimeAttestedResumePort::new(
+        Arc::clone(&bindings),
+        Arc::clone(&resume_guard),
+    ));
+    let store = Arc::new(InMemoryTurnStateStore::default().with_attested_resume_port(port));
+    let composition = build_composition(Arc::clone(&bindings));
+    composition
+        .register_attested_gate(
+            SigningGateRef::new(GATE),
+            binding(&account_hex, hash),
+            0,
+            None,
+        )
+        .await
+        .expect("register attested gate");
+
+    let thread_service = Arc::new(InMemorySessionThreadService::default());
+    ensure_thread(&thread_service).await;
+    let coordinator: Arc<dyn TurnCoordinator> =
+        Arc::new(DefaultTurnCoordinator::new(store.clone()));
+    let verify_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let drive_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counting = CountingContinuation {
+        inner: RebornAttestedContinuation::new(&composition),
+        verify_calls: Arc::clone(&verify_calls),
+        drive_calls: Arc::clone(&drive_calls),
+    };
+    let services = RebornServices::new(thread_service, coordinator)
+        .with_attested_continuation(Arc::new(counting));
+    (
+        services,
+        store,
+        hash_ref,
+        key,
+        hash,
+        account_hex,
+        verify_calls,
+        drive_calls,
+    )
+}
+
+/// A same-`client_action_id` retry replays the cached `resume_turn` success but
+/// must NOT double-drive the continuation (no double sign/broadcast).
+#[tokio::test]
+async fn resolve_gate_attested_retry_drives_continuation_once() {
+    let (services, store, hash_ref, key, hash, account_hex, _verify, drive) =
+        wired_services_with_counting(0x44).await;
+    let run_id = block_attested(&store, &hash_ref).await;
+
+    let req = || attested_request(run_id, &key, &hash, &account_hex, "action-retry");
+
+    // First (fresh) resolve drives the continuation once.
+    services
+        .resolve_gate(caller(), req())
+        .await
+        .expect("fresh attested resolve succeeds");
+    assert_eq!(
+        drive.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "fresh resolve drives the continuation exactly once"
+    );
+
+    // Retry with the SAME client_action_id replays the cached resume success;
+    // the continuation must NOT fire again.
+    services
+        .resolve_gate(caller(), req())
+        .await
+        .expect("same-client_action_id retry replays cached success");
+    assert_eq!(
+        drive.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "retry must NOT double-drive the continuation"
+    );
+}
+
+/// A malformed proof must be rejected by the non-mutating preflight BEFORE
+/// `resume_turn`, leaving the turn `BlockedAttested` and driving NO continuation.
+#[tokio::test]
+async fn resolve_gate_attested_malformed_proof_fails_before_resume() {
+    let (services, store, hash_ref, key, hash, account_hex, verify, drive) =
+        wired_services_with_counting(0x55).await;
+    let run_id = block_attested(&store, &hash_ref).await;
+
+    // Corrupt the proof so decode fails: a multibyte-Unicode signature field
+    // (also exercises the panic-free hex path).
+    let mut req = attested_request(run_id, &key, &hash, &account_hex, "action-bad");
+    req.attested_proof = Some(json!({
+        "scheme": "solana",
+        "approved_tx_hash": lower_hex(hash.as_bytes()),
+        "claimed_signer": account_hex,
+        "signature": "déadbeef",
+        "public_key": account_hex,
+    }));
+
+    let result = services.resolve_gate(caller(), req).await;
+    assert!(result.is_err(), "malformed proof must fail closed");
+    assert_eq!(
+        verify.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "preflight verify ran"
+    );
+    assert_eq!(
+        drive.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "continuation must NOT be driven for a malformed proof"
+    );
+
+    // The turn must remain BlockedAttested (no state mutated): a follow-up VALID
+    // resolve with a fresh client_action_id still succeeds and drives once.
+    let ok = services
+        .resolve_gate(
+            caller(),
+            attested_request(run_id, &key, &hash, &account_hex, "action-good"),
+        )
+        .await;
+    assert!(
+        ok.is_ok(),
+        "turn stayed BlockedAttested after the malformed-proof rejection: {ok:?}"
+    );
+    assert_eq!(
+        drive.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the valid follow-up drives the continuation exactly once"
+    );
+}
+
+/// `register_attested_gate` rejects a gate_ref that mismatches
+/// `binding.context.gate_ref` and refuses to overwrite an existing binding.
+#[tokio::test]
+async fn register_attested_gate_rejects_mismatch_and_is_insert_only() {
+    let hash = bound_hash();
+    let key = EdSigningKey::from_bytes(&[0x66u8; 32]);
+    let account_hex = lower_hex(&key.verifying_key().to_bytes());
+    let bindings = Arc::new(InMemoryAttestedGateBindingStore::new());
+    let composition = build_composition(Arc::clone(&bindings));
+
+    // gate_ref mismatch: binding.context.gate_ref is GATE, register under a
+    // different gate_ref => GateRefMismatch.
+    let mismatch = composition
+        .register_attested_gate(
+            SigningGateRef::new("gate:other"),
+            binding(&account_hex, hash),
+            0,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(mismatch, Err(RegisterAttestedGateError::GateRefMismatch)),
+        "gate_ref/binding mismatch must be rejected, got {mismatch:?}"
+    );
+
+    // First valid raise succeeds.
+    composition
+        .register_attested_gate(
+            SigningGateRef::new(GATE),
+            binding(&account_hex, hash),
+            0,
+            None,
+        )
+        .await
+        .expect("first raise succeeds");
+
+    // Second raise for the same gate is refused (insert-only).
+    let dup = composition
+        .register_attested_gate(
+            SigningGateRef::new(GATE),
+            binding(&account_hex, hash),
+            0,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(dup, Err(RegisterAttestedGateError::DuplicateBinding)),
+        "a second raise for the same gate must be refused, got {dup:?}"
     );
 }

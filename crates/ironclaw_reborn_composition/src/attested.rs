@@ -32,6 +32,37 @@ use ironclaw_attested_runtime::{
 use ironclaw_chain_signing::{CustodialSigner, DenyFirstCustodyPolicy, SecretsKeyStore, ShipGate};
 use ironclaw_signing_provider::{GateRef, SigningContext};
 
+/// Error from [`RebornAttestedComposition::register_attested_gate`]. Distinct
+/// from [`ironclaw_attestation::GrantError`] so the gate-raise caller can tell
+/// a hardening rejection (mismatched gate_ref / duplicate raise) apart from a
+/// grant-store backend failure.
+#[derive(Debug)]
+pub enum RegisterAttestedGateError {
+    /// The supplied `gate_ref` did not equal `binding.context.gate_ref`.
+    GateRefMismatch,
+    /// A binding (or sealed grant) already exists for this gate: registration is
+    /// insert-only and the first raise wins.
+    DuplicateBinding,
+    /// The underlying sealed-grant store failed.
+    Grant(ironclaw_attestation::GrantError),
+}
+
+impl std::fmt::Display for RegisterAttestedGateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GateRefMismatch => {
+                write!(f, "gate_ref does not match binding.context.gate_ref")
+            }
+            Self::DuplicateBinding => {
+                write!(f, "attested gate already registered (insert-only)")
+            }
+            Self::Grant(e) => write!(f, "sealed-grant store failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for RegisterAttestedGateError {}
+
 /// The concrete custodial signer type the local-dev composition assembles. Its
 /// generic parameters are pinned here so the rest of the runtime never names
 /// them.
@@ -123,21 +154,54 @@ impl RebornAttestedComposition {
     /// redefine it (threats #2 / #3 / #4).
     ///
     /// In-memory only (PR11); durable PG / libSQL backends are PR12.
+    ///
+    /// Hardening invariants enforced here:
+    /// - The supplied `gate_ref` MUST equal `binding.context.gate_ref`. A
+    ///   mismatch would let the binding be filed under a key that names a
+    ///   different gate than the one the authoritative context describes — the
+    ///   resume port and driver both look the binding up by `gate_ref`, so a
+    ///   mismatch is a binding-confusion vector. Fail closed.
+    /// - Registration is INSERT-ONLY: an existing binding for the same gate
+    ///   (request id) is never overwritten. The first raise wins; a second raise
+    ///   for the same gate is refused so an attacker cannot redefine the
+    ///   authoritative `(hash, signer, decoded tx)` after the fact (threats
+    ///   #2/#3/#4). The grant seal is likewise one-shot.
     pub async fn register_attested_gate(
         &self,
         gate_ref: GateRef,
         binding: AttestedGateBinding,
         created_at_ms: i64,
         expiry_ms: Option<i64>,
-    ) -> Result<(), ironclaw_attestation::GrantError> {
+    ) -> Result<(), RegisterAttestedGateError> {
+        // gate_ref must match the authoritative context's gate_ref.
+        if binding.context.gate_ref.as_str() != gate_ref.as_str() {
+            return Err(RegisterAttestedGateError::GateRefMismatch);
+        }
+
+        // Insert-only: refuse to overwrite an existing binding for this gate.
+        if self.bindings.get(&gate_ref).await.is_some() {
+            return Err(RegisterAttestedGateError::DuplicateBinding);
+        }
+
+        // Seal the one-shot grant first. A duplicate seal (AlreadySealed) means
+        // the gate was already raised; surface it as a duplicate rather than
+        // proceeding to (re)write the binding.
         let grant_key = GrantKey::from_context(&binding.context, binding.approved_tx_hash);
-        self.grants
+        match self
+            .grants
             .seal(AttestedSigningGrant::seal(
                 grant_key,
                 created_at_ms,
                 expiry_ms,
             ))
-            .await?;
+            .await
+        {
+            Ok(()) => {}
+            Err(ironclaw_attestation::GrantError::AlreadySealed) => {
+                return Err(RegisterAttestedGateError::DuplicateBinding);
+            }
+            Err(other) => return Err(RegisterAttestedGateError::Grant(other)),
+        }
         self.bindings.put(gate_ref, binding).await;
         Ok(())
     }

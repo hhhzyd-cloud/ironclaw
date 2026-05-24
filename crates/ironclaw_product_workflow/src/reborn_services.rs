@@ -4,7 +4,8 @@
 //! instead of reaching into turn coordination, thread stores, runtime lanes, DB
 //! stores, dispatchers, or capability hosts directly.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -146,6 +147,17 @@ pub struct RebornServices {
     /// `ironclaw_attested_runtime`). When `None`, attested resolutions fail
     /// closed (attested signing not enabled on this deployment).
     attested_continuation: Option<Arc<dyn AttestedGateContinuationPort>>,
+    /// Facade-level idempotency guard for the attested continuation. Keyed on the
+    /// full request fingerprint (gate_ref + client_action_id), it ensures the
+    /// deterministic sign + broadcast continuation is dispatched EXACTLY ONCE per
+    /// resolved gate: a same-`client_action_id` retry replays the cached
+    /// `resume_turn` success but must NOT double-drive the continuation
+    /// (double sign/broadcast). The underlying driver's ledger guard is the last
+    /// line of defense; this stops the double-drive at the facade.
+    ///
+    // rebase: prefer ResumeTurnResponse.replayed once PR5 propagates — gate the
+    // continuation on `replayed == false` and drop this fingerprint set.
+    attested_continuation_fired: Arc<Mutex<HashSet<String>>>,
 }
 
 impl RebornServices {
@@ -160,6 +172,7 @@ impl RebornServices {
             skill_activation_recorder: None,
             skill_activation_clearer: None,
             attested_continuation: None,
+            attested_continuation_fired: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -228,6 +241,18 @@ impl RebornServices {
         Ok(())
     }
 
+    /// Atomically record that the attested continuation has fired for
+    /// `fingerprint`. Returns `true` if THIS caller is the first to claim it
+    /// (and should therefore drive the continuation), `false` if it was already
+    /// claimed (a replay — the continuation must not fire again). A poisoned
+    /// lock fails closed: it returns `false` so a replay can never double-drive.
+    fn claim_attested_continuation(&self, fingerprint: &str) -> bool {
+        match self.attested_continuation_fired.lock() {
+            Ok(mut fired) => fired.insert(fingerprint.to_string()),
+            Err(_) => false,
+        }
+    }
+
     /// Resolve a `BlockedAttested` gate with an external-wallet / custodial
     /// attested-signing proof (PR11).
     ///
@@ -269,6 +294,34 @@ impl RebornServices {
         let attestation = AttestationClaimRef::new(claim.approved_tx_hash_hex.clone())
             .map_err(|_| attested_invalid_field("attested_approved_tx_hash"))?;
 
+        // FAIL-CLOSED ORDERING (verify -> resume -> drive). Run the non-mutating
+        // preflight (decode + authoritative-binding hash re-check) BEFORE
+        // `resume_turn`. `resume_turn` transitions `BlockedAttested ->
+        // AttestedResolved`, clears the gate_ref, and consumes the one-shot resume
+        // guard; we must not commit that transition for a proof that would only
+        // be rejected later. On any preflight failure the turn stays
+        // `BlockedAttested` and NO run/mission/gate/ledger/grant state is mutated.
+        //
+        // NOTE: the full cryptographic signature verification + sealed-grant CAS
+        // still runs in `continue_resolved_gate` after the transition, because the
+        // only verification entrypoint (`SigningProvider::verify_resume`) claims
+        // the one-shot grant and cannot be invoked twice. Moving that ahead of the
+        // transition requires a verify-vs-claim split inside
+        // `ironclaw_attested_runtime` (PR10) — flagged, not changed on this branch.
+        continuation
+            .verify_resolution(&scope, run_id, &gate_ref, &claim)
+            .await
+            .map_err(map_attested_continuation_rejection)?;
+
+        // Idempotency fingerprint for the continuation: gate_ref + client_action_id.
+        // A same-`client_action_id` retry replays the cached `resume_turn`
+        // success below, but must drive the continuation EXACTLY ONCE.
+        let continuation_fingerprint = attested_continuation_fingerprint(
+            &scope,
+            &gate_ref_string(&gate_ref),
+            client_action_id.as_str(),
+        );
+
         let binding_id = webui_gate_binding_id(&scope, &gate_ref_string(&gate_ref));
         let resume = self
             .turn_coordinator
@@ -288,14 +341,25 @@ impl RebornServices {
             .await
             .map_err(map_turn_error)?;
 
-        // The turn is `AttestedResolved`. Drive the deterministic sign +
-        // broadcast continuation. A continuation failure does NOT roll the turn
-        // back (the resume guard already consumed the one-shot); it surfaces as
-        // a sanitized error so the client can observe the failure category.
-        continuation
-            .continue_resolved_gate(&scope, run_id, &gate_ref, &claim)
-            .await
-            .map_err(map_attested_continuation_rejection)?;
+        // Drive the continuation EXACTLY ONCE for this fingerprint. The first
+        // (fresh) resolve records the fingerprint and drives; a replay finds the
+        // fingerprint already recorded and returns the resumed response WITHOUT
+        // re-driving (no double sign/broadcast).
+        //
+        // rebase: prefer ResumeTurnResponse.replayed once PR5 propagates — gate
+        // on `replayed == false` instead of this fingerprint set.
+        let should_drive = self.claim_attested_continuation(&continuation_fingerprint);
+        if should_drive {
+            // The turn is `AttestedResolved`. Drive the deterministic sign +
+            // broadcast continuation. A continuation failure does NOT roll the
+            // turn back (the resume guard already consumed the one-shot); it
+            // surfaces as a sanitized error so the client can observe the
+            // failure category.
+            continuation
+                .continue_resolved_gate(&scope, run_id, &gate_ref, &claim)
+                .await
+                .map_err(map_attested_continuation_rejection)?;
+        }
 
         Ok(RebornResolveGateResponse::Resumed(resume.into()))
     }
@@ -1293,6 +1357,25 @@ fn webui_gate_binding_id(scope: &TurnScope, gate_ref: &str) -> String {
 
 fn gate_ref_string(gate_ref: &ironclaw_turns::GateRef) -> String {
     gate_ref.as_str().to_string()
+}
+
+/// Stable fingerprint for the attested-continuation idempotency guard. Binds the
+/// full request identity (scope + gate_ref + client_action_id) so the
+/// deterministic sign + broadcast continuation fires exactly once per resolved
+/// gate even across same-`client_action_id` retries.
+fn attested_continuation_fingerprint(
+    scope: &TurnScope,
+    gate_ref: &str,
+    client_action_id: &str,
+) -> String {
+    format!(
+        "{}{}{}{}{}",
+        segment("surface", "webui-attested-continuation"),
+        segment("tenant", scope.tenant_id.as_str()),
+        segment("thread", scope.thread_id.as_str()),
+        segment("gate", gate_ref),
+        segment("action", client_action_id)
+    )
 }
 
 /// A malformed attested-resolution field, mapped to the standard validation

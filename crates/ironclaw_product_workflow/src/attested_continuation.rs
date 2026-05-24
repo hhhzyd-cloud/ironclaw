@@ -133,6 +133,33 @@ impl AttestedContinuationRejection {
 /// verification, the sealed-grant CAS, and the ledger-guarded sign + broadcast.
 #[async_trait]
 pub trait AttestedGateContinuationPort: Send + Sync {
+    /// Non-mutating preflight run BEFORE `resume_turn`, so the facade only
+    /// commits the `BlockedAttested -> AttestedResolved` transition (which clears
+    /// the gate and consumes the one-shot resume guard) for a claim that will not
+    /// be rejected outright.
+    ///
+    /// This decodes the opaque [`AttestedProofClaim`] and re-checks it against
+    /// the authoritative gate binding the implementation persisted at gate-raise
+    /// (proof family / provider match, embedded approved-tx-hash equals the bound
+    /// hash). It MUST NOT mutate any run/mission/gate/ledger/grant state: a
+    /// failure here leaves the turn `BlockedAttested` with no side effects.
+    ///
+    /// NOTE: the heavyweight cryptographic signature verification + sealed-grant
+    /// CAS still runs in [`Self::continue_resolved_gate`] AFTER the transition,
+    /// because the only verification entrypoint
+    /// (`SigningProvider::verify_resume`) atomically claims the one-shot grant and
+    /// so cannot be invoked twice. Moving the signature check ahead of the
+    /// transition without claiming the grant requires splitting verify-vs-claim
+    /// inside `ironclaw_attested_runtime` (PR10) — a flagged coordination item,
+    /// not changed on this branch.
+    async fn verify_resolution(
+        &self,
+        scope: &TurnScope,
+        run_id: TurnRunId,
+        gate_ref: &GateRef,
+        claim: &AttestedProofClaim,
+    ) -> Result<(), AttestedContinuationRejection>;
+
     /// Drive the deterministic sign + broadcast continuation for the resolved
     /// gate. `scope`/`run_id` identify the run; `gate_ref` selects the
     /// authoritative binding; `claim` carries the opaque verified-proof payload.

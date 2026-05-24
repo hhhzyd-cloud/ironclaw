@@ -46,7 +46,7 @@ mod webui_ws_origin;
 
 use ironclaw_runtime_policy::{EffectiveRuntimePolicy as ResolvedRuntimePolicy, ResolveError};
 
-pub use attested::{NoopBroadcaster, RebornAttestedComposition};
+pub use attested::{NoopBroadcaster, RebornAttestedComposition, RegisterAttestedGateError};
 pub use attested_continuation::RebornAttestedContinuation;
 pub use auth::{
     RebornAuthContinuationDispatcher, RebornOAuthCallbackError, RebornOAuthCallbackOutcome,
