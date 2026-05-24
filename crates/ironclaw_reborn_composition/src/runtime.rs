@@ -893,7 +893,7 @@ pub async fn build_reborn_runtime(
     // external-wallet provider registry starts empty here; PR11's gate/resolve
     // ingress registers the injected/NEAR/WalletConnect providers over the
     // shared grant store when it owns the per-provider ceremony secrets.
-    let attested_signing = build_attested_composition(attested_gate_bindings);
+    let attested_signing = build_attested_composition(attested_gate_bindings)?;
 
     Ok(RebornRuntime {
         services,
@@ -927,14 +927,16 @@ pub async fn build_reborn_runtime(
 /// key; durable persistence of grants/ledger/keystore is PR12.
 fn build_attested_composition(
     bindings: Arc<InMemoryAttestedGateBindingStore>,
-) -> RebornAttestedComposition {
+) -> Result<RebornAttestedComposition, RebornRuntimeError> {
     // Local-dev master key for the custodial keystore AAD. Production wires a
     // real master key (OS keychain / KMS); this dev key never signs mainnet
     // because the ship-gate refuses it without secure custody.
     let crypto = SecretsCrypto::new(SecretString::from(
         "0123456789abcdef0123456789ABCDEF".to_string(),
     ))
-    .expect("local-dev master key is a valid 32-byte secret");
+    .map_err(|error| RebornRuntimeError::InvalidArgument {
+        reason: format!("local-dev custodial master key is invalid: {error}"),
+    })?;
     let keystore = Arc::new(SecretsKeyStore::new(crypto));
 
     // No KMS backend in local-dev: mainnet custodial signing stays refused.
@@ -945,9 +947,13 @@ fn build_attested_composition(
     // (custodial-only). PR13's `AttestedProvidersConfig` layers on this closure
     // to register WalletConnect / Injected / NEAR providers over the SAME shared
     // `grants` store the driver uses (shared one-shot CAS, threat #1).
-    RebornAttestedComposition::new(bindings, keystore, ship_gate, grants, |_grants| {
-        ProviderRegistry::new()
-    })
+    Ok(RebornAttestedComposition::new(
+        bindings,
+        keystore,
+        ship_gate,
+        grants,
+        |_grants| ProviderRegistry::new(),
+    ))
 }
 
 const LOOP_RUN_CAPABILITY_ID: &str = "loop.run";
