@@ -6,4 +6,20 @@
 #![forbid(unsafe_code)]
 
 pub mod coding;
-pub mod gsuite;
+mod gsuite;
+
+pub use gsuite::{
+    CALENDAR_ADD_ATTENDEES_CAPABILITY_ID, CALENDAR_CREATE_EVENT_CAPABILITY_ID,
+    CALENDAR_DELETE_EVENT_CAPABILITY_ID, CALENDAR_EXTENSION_ID,
+    CALENDAR_FIND_FREE_SLOTS_CAPABILITY_ID, CALENDAR_GET_EVENT_CAPABILITY_ID,
+    CALENDAR_LIST_CALENDARS_CAPABILITY_ID, CALENDAR_LIST_EVENTS_CAPABILITY_ID,
+    CALENDAR_SET_REMINDER_CAPABILITY_ID, CALENDAR_UPDATE_EVENT_CAPABILITY_ID,
+    GMAIL_CREATE_DRAFT_CAPABILITY_ID, GMAIL_EXTENSION_ID, GMAIL_GET_MESSAGE_CAPABILITY_ID,
+    GMAIL_LIST_MESSAGES_CAPABILITY_ID, GMAIL_REPLY_TO_MESSAGE_CAPABILITY_ID,
+    GMAIL_SEND_MESSAGE_CAPABILITY_ID, GMAIL_TRASH_MESSAGE_CAPABILITY_ID, GSUITE_OUTPUT_BYTES_LIMIT,
+    GSUITE_RESPONSE_BODY_LIMIT, GSUITE_TIMEOUT_MS, GoogleCredential, GoogleCredentialError,
+    GoogleCredentialResolver, GsuiteCapabilitySpec, GsuiteDispatchError, GsuiteDispatchRequest,
+    GsuiteDispatchResult, GsuiteExecutor, GsuitePackageSpec, calendar_package_spec,
+    gmail_package_spec, google_api_network_policy, google_provider_id, gsuite_package_specs,
+    gsuite_resource_profile,
+};
