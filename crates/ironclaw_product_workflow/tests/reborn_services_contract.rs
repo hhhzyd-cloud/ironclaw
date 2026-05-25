@@ -642,6 +642,13 @@ impl SessionThreadService for ScriptedThreadService {
         scripted_stub_unreachable("append_tool_result_reference")
     }
 
+    async fn update_tool_result_reference(
+        &self,
+        _request: UpdateToolResultReferenceRequest,
+    ) -> Result<ThreadMessageRecord, SessionThreadError> {
+        scripted_stub_unreachable("update_tool_result_reference")
+    }
+
     async fn update_assistant_draft(
         &self,
         _request: UpdateAssistantDraftRequest,

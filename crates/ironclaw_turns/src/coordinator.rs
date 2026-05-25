@@ -230,12 +230,15 @@ where
         request: SubmitTurnRequest,
     ) -> Result<SubmitTurnResponse, TurnError> {
         // If the caller passed a run id that came out of prepare_turn, verify
-        // it is being submitted under the same scope it was prepared under.
-        // Reservations are consumed on the first submit attempt; a second
-        // attempt with the same id falls back to the store's duplicate-bound
-        // check.
+        // it is being submitted under the same scope it was prepared under,
+        // *unless* this is a child run (parent_run_id set) — subagent spawn
+        // legitimately prepares a run id in the parent scope and submits it
+        // under a different child scope. Reservations are consumed on the
+        // first submit attempt; a second attempt with the same id falls back
+        // to the store's duplicate-bound check.
         if let Some(requested) = request.requested_run_id
             && let Some(prepared_scope) = self.consume_prepared_run_id(requested)
+            && request.parent_run_id.is_none()
             && prepared_scope != request.scope
         {
             return Err(TurnError::Unauthorized);

@@ -85,11 +85,11 @@ use ironclaw_threads::{
 use ironclaw_trust::EffectiveTrustClass;
 use ironclaw_trust::{AdminConfig, AdminEntry, HostTrustAssignment, HostTrustPolicy};
 use ironclaw_turns::{
-    CancelRunRequest, DefaultTurnCoordinator, FilesystemTurnStateStore, GateRef,
-    GetLoopCheckpointRequest, GetRunStateRequest, IdempotencyKey, InMemoryCheckpointStateStore,
-    LoopBlockedKind, LoopCheckpointKind, LoopCheckpointStore, LoopGateRef, LoopResultRef,
-    ReplyTargetBindingRef, ResumeTurnRequest, SanitizedCancelReason, SourceBindingRef, TurnActor,
-    TurnCoordinator, TurnError, TurnRunId, TurnRunState, TurnScope, TurnStateStore, TurnStatus,
+    CancelRunRequest, FilesystemTurnStateStore, GateRef, GetLoopCheckpointRequest,
+    GetRunStateRequest, IdempotencyKey, InMemoryCheckpointStateStore, LoopBlockedKind,
+    LoopCheckpointKind, LoopCheckpointStore, LoopGateRef, LoopResultRef, ReplyTargetBindingRef,
+    ResumeTurnRequest, SanitizedCancelReason, SourceBindingRef, TurnActor, TurnCoordinator,
+    TurnError, TurnRunId, TurnRunState, TurnScope, TurnStateStore, TurnStatus,
     run_profile::{
         AgentLoopHostError, AgentLoopHostErrorKind, CapabilityBatchInvocation,
         CapabilityBatchOutcome, CapabilityCallCandidate, CapabilityDescriptorView,
@@ -135,7 +135,7 @@ pub struct RebornBinaryE2EHarness {
     thread_scope: ThreadScope,
     turn_scope: TurnScope,
     turn_store: Arc<FilesystemTurnStateStore<LocalFilesystem>>,
-    coordinator: Arc<DefaultTurnCoordinator<FilesystemTurnStateStore<LocalFilesystem>>>,
+    coordinator: Arc<dyn ironclaw_turns::TurnCoordinator>,
     _product_harness: RebornProductWorkflowHarness,
     thread_harness: RebornThreadHarness,
     model_gateway: RebornTraceReplayModelGateway,
