@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/nearai/ironclaw/compare/ironclaw_common-v0.4.2...ironclaw_common-v0.5.0) - 2026-05-25
+
+### Added
+
+- *(web)* support externally-provided tools in Responses API ([#3122](https://github.com/nearai/ironclaw/pull/3122))
+
 ## [0.4.2](https://github.com/nearai/ironclaw/compare/ironclaw_common-v0.4.1...ironclaw_common-v0.4.2) - 2026-05-11
 
 ### Added
